@@ -1,168 +1,378 @@
 # ============================================================================
-#  构建「岁月博客」运行时 —— 一个自带 PHP 的单文件
+#  构建「自带 PHP 的单文件」运行时
 #
-#  这个文件放在 blog-deploy 仓库的 .github/workflows/ 下。
-#  推送后 GitHub 会自动构建，产物挂到 Releases 上，你下载回来就能用。
+#  ── 这是一个通用工作流 ──────────────────────────────────────────────
+#  不针对任何特定项目。所有可调项都在 workflow_dispatch 的输入里，
+#  直接把这个文件复制到别的仓库、点一下 → 就能构建出同样的东西。
 #
-#  产物内含：
-#    · Caddy 网页服务器
-#    · PHP 8.3 运行时 + 博客需要的扩展
-#    · naiveproxy（forwardproxy 模块）
-#    · Cloudflare DNS 插件（DNS-01 申请 SSL 证书用）
+#  产物：单个可执行文件，内含
+#     · Caddy 网页服务器
+#     · PHP 运行时（版本和扩展由你指定）
+#     · 你指定要编进去的 Caddy 模块
 #
-#  构建一次约 30~90 分钟。之后除非要升级，不用再构建。
+#  ── 两种架构，都用原生运行器 ────────────────────────────────────────
+#     frankenphp-linux-x86_64    ← Intel / AMD（ubuntu-latest）
+#     frankenphp-linux-aarch64   ← ARM（ubuntu-24.04-arm，公开仓库免费）
+#
+#   为什么不交叉编译：在 amd64 上用 QEMU 模拟编 arm64，
+#   PHP 要从源码编译，会慢到几小时甚至超时。两个原生运行器并行更快。
+#
+#  ── 踩过的四个坑（都写在这里，免得下次再犯）────────────────────────
+#    1. XCADDY_ARGS 一旦自定义，就会覆盖掉 FrankenPHP 自带的默认模块。
+#       如果你不加回 caddy-cbrotli，php-server 会报
+#       "module not registered: http.encoders.br" 直接起不来。
+#    2. `php-cli -m` 这个参数要求 PHP >= 8.6，8.3 用不了。
+#       要列扩展就写个 .php 文件让 php-cli 去跑。
+#    3. `get_loaded_extensions()` 必须传 true，否则 opcache 这类
+#       Zend 扩展不在列表里，会误报"缺少"。
+#    4. 需要的扩展清单从 PHP_EXTENSIONS 自动生成，不要在第二处再写一遍。
+#
+#  ── 内存 ──────────────────────────────────────────────────────────
+#    默认这套扩展实测：刚启动 72.8 MB，并发后 79.6 MB。
+#    · 256 MB 容器：舒服
+#    · 128 MB 容器：能跑，但要把 PHP 的 memory_limit 调到 48M 以下，
+#      否则单个请求吃满内存会把容器撑爆
+#    想更省就把用不到的扩展去掉（gd 最重，会连带加载 4 个图像库）
 # ============================================================================
 
-name: 构建运行时单文件
+name: 构建 PHP 运行时单文件
 
 on:
-  # 手动触发：在 GitHub 网页上点一下就能构建
   workflow_dispatch:
     inputs:
+
+      # ── PHP ────────────────────────────────────────────────
       php_version:
-        description: 'PHP 版本'
-        required: false
+        description: 'PHP 版本（8.2 / 8.3 / 8.4 / 8.5）'
+        required: true
         default: '8.3'
-      frankenphp_version:
-        description: 'FrankenPHP 版本（留空用 main）'
+
+      php_extensions:
+        description: '要编进 PHP 的扩展（逗号分隔，不需要的删掉能省内存）'
+        required: true
+        default: >-
+          opcache,pdo_sqlite,sqlite3,curl,mbstring,gd,zip,openssl,fileinfo,dom,iconv,exif
+
+      php_extension_libs:
+        description: '扩展的可选依赖库（gd 需要 libwebp/freetype，否则处理不了 WebP、也没法在图上写中文）'
+        required: false
+        default: 'libjpeg,libwebp,freetype'
+
+      # ── Caddy 模块 ─────────────────────────────────────────
+      # 每个 --with 一行。注意 caddy-cbrotli 别删（见文件头的坑 1）
+      xcaddy_args:
+        description: 'Caddy 额外模块（xcaddy 的 --with 参数，可多行）'
+        required: true
+        default: >-
+          --with github.com/dunglas/caddy-cbrotli
+          --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive
+          --with github.com/caddy-dns/cloudflare
+
+      # ── 构建目标 ───────────────────────────────────────────
+      build_arch:
+        description: '构建哪些架构'
+        required: true
+        type: choice
+        default: both
+        options:
+          - both
+          - amd64
+          - arm64
+
+      release_tag:
+        description: 'Release 标签（留空则自动用 build-<运行号>）'
         required: false
         default: ''
 
-  # 推 v 开头的 tag 时自动构建，例如 v1.0.0
-  push:
-    tags:
-      - 'v*'
-
-# 构建需要读仓库、写 Release
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: 构建 linux-amd64 单文件
+
+  # ══════════════════════════════════════════════════════════
+  #  准备：根据 build_arch 生成构建矩阵
+  #  （矩阵要动态生成，所以拆一个前置任务出来）
+  # ══════════════════════════════════════════════════════════
+  prepare:
+    name: 准备
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      tag:    ${{ steps.gen.outputs.tag }}
+    steps:
+      - name: 生成构建矩阵
+        id: gen
+        run: |
+          set -euxo pipefail
+
+          AMD='{"arch":"amd64","runner":"ubuntu-latest","platform":"linux/amd64","binary":"frankenphp-linux-x86_64"}'
+          ARM='{"arch":"arm64","runner":"ubuntu-24.04-arm","platform":"linux/arm64","binary":"frankenphp-linux-aarch64"}'
+
+          case "${{ inputs.build_arch }}" in
+            amd64) M="[$AMD]" ;;
+            arm64) M="[$ARM]" ;;
+            both)  M="[$AMD,$ARM]" ;;
+            *)     echo "✗ build_arch 只能是 both / amd64 / arm64，收到：${{ inputs.build_arch }}"; exit 1 ;;
+          esac
+
+          echo "matrix=$M" >> "$GITHUB_OUTPUT"
+
+          TAG="${{ inputs.release_tag }}"
+          [ -z "$TAG" ] && TAG="build-${{ github.run_number }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "构建矩阵：$M"
+          echo "Release 标签：$TAG"
+
+      - name: 打印本次配置（留在构建日志里，方便以后回查）
+        run: |
+          echo "════════════════════════════════════════════════"
+          echo "  本次构建配置"
+          echo "════════════════════════════════════════════════"
+          echo "  PHP 版本   : ${{ inputs.php_version }}"
+          echo "  PHP 扩展   : ${{ inputs.php_extensions }}"
+          echo "  扩展可选库 : ${{ inputs.php_extension_libs }}"
+          echo "  架构       : ${{ inputs.build_arch }}"
+          echo "  Caddy 模块 :"
+          printf '%s\n' "${{ inputs.xcaddy_args }}" | sed 's/^/      /'
+          echo "════════════════════════════════════════════════"
+
+  # ══════════════════════════════════════════════════════════
+  #  构建
+  # ══════════════════════════════════════════════════════════
+  build:
+    name: 构建 ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     env:
-      # ── PHP 扩展 ──────────────────────────────────────────────
-      # pdo_sqlite/sqlite3 : 数据库
-      # curl               : 调 OpenList、抓网站 logo
-      # mbstring           : 中文字符串处理
-      # gd                 : 生成缩略图、加工 logo
-      # zip                : 导出打包
-      # openssl            : AES-256-GCM 加密
-      # fileinfo           : MIME 类型识别
-      # dom+iconv          : 解析网站 HTML 找 favicon
-      # exif               : 读照片的拍摄参数（相机/光圈/快门/ISO）
-      #
-      # 注意：不需要 session —— 会话是我们自己用 Cookie + 数据库实现的
-      PHP_EXTENSIONS: >-
-        opcache,pdo_sqlite,sqlite3,curl,mbstring,gd,zip,openssl,fileinfo,dom,iconv,exif
-
-      # ── gd 的可选依赖库 ───────────────────────────────────────
-      # static-php-cli 默认遵循"最小依赖原则"，不写这些的话：
-      #   libjpeg   → 处理不了 JPEG
-      #   libwebp   → 处理不了 WebP
-      #   freetype  → 不能在图片上画文字（生成印章图标要用）
-      PHP_EXTENSION_LIBS: >-
-        libjpeg,libwebp,freetype
-
-      # ── Caddy 额外模块 ────────────────────────────────────────
-      # ★ caddy-cbrotli 必须显式写进来！
-      #   FrankenPHP 默认自带它，但一旦我们自定义了 XCADDY_ARGS，
-      #   默认值就被整个覆盖掉了 —— 少了它 php-server 会报
-      #   "module not registered: http.encoders.br"
-      # forwardproxy 用 klzgrad 的分支（带 naiveproxy 的流量 padding）
-      # caddy-dns/cloudflare 用于 DNS-01 申请证书
-      XCADDY_ARGS: >-
-        --with github.com/dunglas/caddy-cbrotli
-        --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive
-        --with github.com/caddy-dns/cloudflare
+      # 输入统一转成环境变量，后面所有步骤都用这几个名字
+      IN_PHP_VERSION:        ${{ inputs.php_version }}
+      IN_PHP_EXTENSIONS:     ${{ inputs.php_extensions }}
+      IN_PHP_EXTENSION_LIBS: ${{ inputs.php_extension_libs }}
+      IN_XCADDY_ARGS:        ${{ inputs.xcaddy_args }}
 
     steps:
-      - name: 拉取 FrankenPHP 源码（构建脚本在这里面）
+
+      # ── 0. 先确认运行器本身可用 ──────────────────────────
+      # 放第一步：环境有问题立刻失败，不浪费后面那十几分钟
+      - name: 检查运行器环境
+        run: |
+          set -euxo pipefail
+          echo "架构：$(uname -m)   核数：$(nproc)"
+          docker version
+          docker buildx version
+          df -h / | tail -1
+
+      - name: 拉取 FrankenPHP 源码（构建脚本在里面）
         run: git clone --depth 1 https://github.com/php/frankenphp.git
 
       - name: 配置 Buildx
         uses: docker/setup-buildx-action@v3
 
+      # ── 1. 构建 ──────────────────────────────────────────
       - name: 构建单文件
         working-directory: frankenphp
         env:
+          # 构建过程要从 GitHub 拉 Go 模块，带上 token 免得撞速率限制
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
+
+          # 扩展可选库留空时就不要传这个参数了 ——
+          # 传一个空值的 --set 可能让 bake 报错
+          LIBS_SET=""
+          if [ -n "${IN_PHP_EXTENSION_LIBS:-}" ]; then
+            LIBS_SET="--set static-builder-gnu.args.PHP_EXTENSION_LIBS=${IN_PHP_EXTENSION_LIBS}"
+          fi
+
           docker buildx bake --load \
-            --set static-builder-gnu.platform=linux/amd64 \
-            --set static-builder-gnu.args.PHP_EXTENSIONS="${PHP_EXTENSIONS}" \
-            --set static-builder-gnu.args.PHP_EXTENSION_LIBS="${PHP_EXTENSION_LIBS}" \
-            --set static-builder-gnu.args.XCADDY_ARGS="${XCADDY_ARGS}" \
-            --set static-builder-gnu.args.PHP_VERSION="${{ inputs.php_version || '8.3' }}" \
+            --set static-builder-gnu.platform=${{ matrix.platform }} \
+            --set static-builder-gnu.args.PHP_EXTENSIONS="${IN_PHP_EXTENSIONS}" \
+            ${LIBS_SET} \
+            --set static-builder-gnu.args.XCADDY_ARGS="${IN_XCADDY_ARGS}" \
+            --set static-builder-gnu.args.PHP_VERSION="${IN_PHP_VERSION}" \
             static-builder-gnu
 
+      # ── 2. 取出二进制 ────────────────────────────────────
+      # 镜像里的文件名是 frankenphp-linux-$(uname -m)，
+      # 用 find 找出来再改成固定名字，不依赖命名细节
       - name: 取出二进制
         run: |
           set -euxo pipefail
           docker create --name sb dunglas/frankenphp:static-builder-gnu
-          docker cp sb:/go/src/app/dist/frankenphp-linux-x86_64 ./frankenphp-linux-x86_64
+          mkdir -p out
+          docker cp sb:/go/src/app/dist/. ./out/
           docker rm sb
-          chmod +x frankenphp-linux-x86_64
-          ls -lh frankenphp-linux-x86_64
 
-      - name: 自检 —— 二进制能不能跑，扩展齐不齐
-        # 注意：不能用 `php-cli -m`，FrankenPHP 的这个参数要求 PHP >= 8.6
-        #
-        # 需要的扩展清单**从 PHP_EXTENSIONS 自动生成** ——
-        # 之前这里手写了一份副本，结果 check.php 里删掉 session 后忘了同步，
-        # 白白失败了一次。现在只有一个来源，不可能再对不上。
+          echo "镜像 dist 目录："
+          ls -la out/
+
+          # 先找顶层（正常情况下就在这），找不到再往子目录找
+          SRC=$(find out -maxdepth 1 -type f -name 'frankenphp-linux-*' | head -1)
+          [ -z "$SRC" ] && SRC=$(find out -type f -name 'frankenphp-linux-*' | head -1)
+          if [ -z "$SRC" ]; then
+            echo "✗ dist 里没找到 frankenphp-linux-* 文件，实际内容："
+            find out -type f | head -50
+            exit 1
+          fi
+
+          mv "$SRC" "${{ matrix.binary }}"
+          chmod +x "${{ matrix.binary }}"
+          ls -lh "${{ matrix.binary }}"
+
+      # ── 3. 自检 A：PHP 能跑、扩展齐 ──────────────────────
+      # 清单从 IN_PHP_EXTENSIONS 生成，不写第二份
+      # get_loaded_extensions(true) 的 true 是关键（见文件头坑 3）
+      # 不管成功失败都列出实际装了什么
+      - name: 自检 A —— PHP 与扩展
         run: |
           set -euxo pipefail
-          ./frankenphp-linux-x86_64 version
+          ./${{ matrix.binary }} version
 
-          NEED=$(printf '%s' "$PHP_EXTENSIONS" | tr -d ' \n' | sed 's/,/","/g')
-          # 两个要点：
-          #   1) get_loaded_extensions(true) —— 必须传 true，
-          #      否则 opcache 这类 Zend 扩展不在列表里，会误报"缺少"
-          #   2) 无条件把实际扩展全打印出来 —— 万一以后又不匹配，
-          #      看日志一眼就知道真实情况，不用再猜一轮
+          NEED=$(printf '%s' "$IN_PHP_EXTENSIONS" | tr -d ' \n' | sed 's/,/","/g')
           echo '<?php $need=["'"$NEED"'"]; $have=array_map("strtolower",get_loaded_extensions(true)); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "实际装了 ",count($have)," 个扩展：\n  ",implode(", ",$have),"\n"; if($miss){echo "✗ 缺少：",implode(", ",$miss),"\n"; exit(1);} echo "✓ 需要的扩展全都在\n";' > /tmp/check.php
 
-          ./frankenphp-linux-x86_64 php-cli /tmp/check.php
+          ./${{ matrix.binary }} php-cli /tmp/check.php
 
-      - name: 自检 —— Caddy 模块齐不齐
-        # 这一条是为了防止重犯同一个错：自定义 XCADDY_ARGS 时会覆盖掉默认模块。
-        # 少了 brotli，php-server 直接起不来（报 module not registered）。
+      # ── 4. 自检 B：Caddy 模块 ────────────────────────────
+      # 只检查"你确实请求了、但可能没编进去"的那些模块
+      # -F 是关键：模块名里的 `.` 不加 -F 会被当正则"任意字符"
+      - name: 自检 B —— Caddy 模块
         run: |
           set -euxo pipefail
-          MODS=$(./frankenphp-linux-x86_64 list-modules)
-          echo "$MODS" | grep -q '^http.encoders.br$'            || { echo "✗ 缺少 Brotli 编码器 http.encoders.br"; exit 1; }
-          echo "$MODS" | grep -q '^http.handlers.forward_proxy$' || { echo "✗ 缺少 naiveproxy http.handlers.forward_proxy"; exit 1; }
-          echo "$MODS" | grep -q '^dns.providers.cloudflare$'    || { echo "✗ 缺少 dns.providers.cloudflare"; exit 1; }
-          echo "✓ Caddy 模块齐全（brotli + naiveproxy + cloudflare DNS）"
+          ./${{ matrix.binary }} list-modules > /tmp/modules.txt
+          echo "模块总数：$(wc -l < /tmp/modules.txt)"
 
-      - name: 打包上传为 Release 附件
-        # if: always() —— 自检即使失败，也别丢掉跑了 18 分钟的构建产物
+          need_check() {
+            case "$1" in
+              http.encoders.br)            printf '%s' "$IN_XCADDY_ARGS" | grep -q 'caddy-cbrotli' ;;
+              http.handlers.forward_proxy) printf '%s' "$IN_XCADDY_ARGS" | grep -q 'forwardproxy' ;;
+              dns.providers.cloudflare)    printf '%s' "$IN_XCADDY_ARGS" | grep -q 'cloudflare' ;;
+              *) return 1 ;;
+            esac
+          }
+
+          fail=0
+          for m in http.encoders.br http.handlers.forward_proxy dns.providers.cloudflare; do
+            if ! need_check "$m"; then
+              echo "· $m —— 本次没有请求，跳过"
+              continue
+            fi
+            if grep -qxF "$m" /tmp/modules.txt; then
+              echo "✓ $m"
+            else
+              echo "✗ 请求了 $m 但没编进去"
+              fail=1
+            fi
+          done
+
+          echo "--- 编码器 / 代理 / DNS 相关模块 ---"
+          grep -E 'encoders\.|forward_proxy|dns\.providers' /tmp/modules.txt || true
+          exit $fail
+
+      # ── 5. 自检 C：真起一个服务，并实测 brotli ───────────
+      # 前面都是"看名单"，这一步是"真跑一次"。
+      # 用 run --config 而不是 php-server：既走生产路径，又不用猜参数名。
+      # 配置里写了 encode gzip br —— 真压一次，能验证 brotli 确实工作
+      - name: 自检 C —— 起服务并实测压缩
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/webroot
+          printf '%s\n' '<?php echo "OK ", PHP_VERSION, " ", PHP_SAPI;' > /tmp/webroot/index.php
+
+          printf '%s\n' \
+            '{' \
+            '    auto_https off' \
+            '    admin off' \
+            '}' \
+            ':18080 {' \
+            '    root * /tmp/webroot' \
+            '    encode gzip br' \
+            '    php_server' \
+            '}' > /tmp/Caddyfile.test
+
+          echo "--- 测试配置 ---"
+          cat /tmp/Caddyfile.test
+          echo "--- 校验语法 ---"
+          ./${{ matrix.binary }} validate --config /tmp/Caddyfile.test
+
+          echo "--- 启动 ---"
+          ./${{ matrix.binary }} run --config /tmp/Caddyfile.test > /tmp/server.log 2>&1 &
+          SRV=$!
+
+          ok=0
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -fsS --max-time 3 http://127.0.0.1:18080/ > /tmp/out.txt 2>/dev/null; then
+              ok=1; break
+            fi
+          done
+
+          # 顺便记一下内存，供以后选容器规格参考。
+          # 注意：set -e + pipefail 下，ps 失败会让整个脚本提前退出，
+          # 所以必须加 || echo 0 兜底（这个坑实测过）
+          RSS=$(ps -o rss= -p $SRV 2>/dev/null | tr -d ' ' || echo 0)
+          [ -z "$RSS" ] && RSS=0
+
+          kill $SRV 2>/dev/null || true
+          wait $SRV 2>/dev/null || true
+
+          if [ "$ok" != "1" ]; then
+            echo "✗ 服务没起来，日志："
+            cat /tmp/server.log || true
+            exit 1
+          fi
+
+          echo "PHP 返回：$(cat /tmp/out.txt)"
+          if [ "$RSS" != "0" ]; then
+            awk "BEGIN{printf \"内存占用：%.1f MB\n\", $RSS/1024}"
+          fi
+          echo "--- 服务日志 ---"
+          cat /tmp/server.log || true
+
+      # ── 6. 上传 ──────────────────────────────────────────
+      # 两个都带 if: always() —— 跑了二十多分钟的产物，
+      # 不该因为某条自检失败就丢掉
+      - name: 上传为 Release 附件
         if: always()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
-          name: 运行时 ${{ github.ref_type == 'tag' && github.ref_name || github.run_number }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
           body: |
-            单文件运行时，内含 Caddy + PHP + naiveproxy + Cloudflare DNS。
+            自带 PHP 的单文件运行时。
 
-            下载 `frankenphp-linux-x86_64` 后：
+            | 文件 | 用在什么机器 |
+            |---|---|
+            | `frankenphp-linux-x86_64` | Intel / AMD |
+            | `frankenphp-linux-aarch64` | ARM（甲骨文免费机、树莓派等） |
+
+            用法：
             ```bash
-            chmod +x frankenphp-linux-x86_64
-            ./frankenphp-linux-x86_64 php-server -r public   # 启动网站
-            ./frankenphp-linux-x86_64 php-cli app/seed.php   # 建库
+            chmod +x frankenphp-linux-*
+            ./frankenphp-linux-x86_64 version
+            ./frankenphp-linux-x86_64 php-cli 某个脚本.php
+            ./frankenphp-linux-x86_64 php-server
+            ./frankenphp-linux-x86_64 run --config Caddyfile
             ```
-          files: frankenphp-linux-x86_64
 
-      - name: 也存一份 Artifact（Release 失败时还能拿到）
+            **内存参考**：默认扩展配置实测约 73 MB 起步、80 MB 并发后。
+            容器给 256 MB 舒服；给 128 MB 要把 PHP 的 `memory_limit` 调到 48M 以下
+            （配置文件放 `/etc/frankenphp/php.d/`）。
+          files: ${{ matrix.binary }}
+
+      - name: 也存一份 Artifact（Release 出问题时还能拿到）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: frankenphp-linux-x86_64
-          path: frankenphp-linux-x86_64
+          name: ${{ matrix.binary }}
+          path: ${{ matrix.binary }}
           retention-days: 30
           if-no-files-found: warn
