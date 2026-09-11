@@ -3,6 +3,7 @@
 # 包含：PHP 8.3 + 指定扩展 + Caddy + 指定模块
 #
 # 参考官方文档：https://frankenphp.dev/zh/docs/embed/
+# 参考官方构建脚本：https://github.com/php/frankenphp/blob/main/build-static.sh
 
 name: Build FrankenPHP Static Binary
 
@@ -44,22 +45,22 @@ jobs:
   # 构建任务：为指定架构编译 FrankenPHP 静态二进制
   # ============================================================
   build:
-    runs-on: ubuntu-24.04
+    # 使用原生运行器：amd64 和 arm64 都有原生支持
+    # 公开仓库可免费使用 ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     
     strategy:
       matrix:
         include:
-          - when: ${{ inputs.architectures == 'both' || inputs.architectures == 'amd64' }}
-            arch: amd64
+          - arch: amd64
+            runner: ubuntu-latest
             platform: linux/amd64
             output_name: frankenphp-linux-x86_64
-          - when: ${{ inputs.architectures == 'both' || inputs.architectures == 'arm64' }}
-            arch: arm64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
             platform: linux/arm64
             output_name: frankenphp-linux-aarch64
-        exclude:
-          - when: false
     
     steps:
       # ------------------------------------------------------------
@@ -69,15 +70,7 @@ jobs:
         uses: actions/checkout@v4
       
       # ------------------------------------------------------------
-      # 步骤 2：设置 QEMU（用于跨平台构建）
-      # 当构建 arm64 时需要 QEMU 模拟器
-      # ------------------------------------------------------------
-      - name: 设置 QEMU
-        uses: docker/setup-qemu-action@v3
-        if: ${{ matrix.arch == 'arm64' }}
-      
-      # ------------------------------------------------------------
-      # 步骤 3：准备应用目录结构
+      # 步骤 2：准备应用目录结构
       # FrankenPHP 静态构建器要求应用代码放在 /go/src/app/dist/app
       # ------------------------------------------------------------
       - name: 准备应用目录
@@ -92,16 +85,18 @@ jobs:
           cat > dist/app/Caddyfile << 'EOF'
           {
               auto_https off
+              admin off
           }
           
           :80 {
               root * /app/public
+              encode gzip br
               php_server
           }
           EOF
       
       # ------------------------------------------------------------
-      # 步骤 4：准备 PHP 扩展和 Caddy 模块参数
+      # 步骤 3：准备 PHP 扩展和 Caddy 模块参数
       # ------------------------------------------------------------
       - name: 准备构建参数
         id: params
@@ -129,10 +124,13 @@ jobs:
           echo "caddy_modules=$CADDY_MODS" >> $GITHUB_OUTPUT
       
       # ------------------------------------------------------------
-      # 步骤 5：创建 Dockerfile（根据官方文档）
+      # 步骤 4：创建 Dockerfile（根据官方文档）
       # 参考：https://frankenphp.dev/zh/docs/embed/
       # 
-      # 使用 ARG 声明构建参数，在 RUN 中作为环境变量传递给 build-static.sh
+      # 关键修正：
+      # 1. 使用 ARG TARGETPLATFORM 让 docker build --platform 生效
+      # 2. 使用 SPC_CMD_VAR_FRANKENPHP_XCADDY_MODULES 传递 Caddy 模块
+      #    （build-static.sh 读取的是这个变量，不是 XCADDY_ARGS）
       # ------------------------------------------------------------
       - name: 创建 Dockerfile
         run: |
@@ -152,13 +150,13 @@ jobs:
           RUN PHP_VERSION="${PHP_VERSION}" \
               PHP_EXTENSIONS="${PHP_EXTENSIONS}" \
               PHP_EXTENSION_LIBS="${PHP_EXTENSION_LIBS}" \
-              XCADDY_ARGS="${XCADDY_ARGS}" \
+              SPC_CMD_VAR_FRANKENPHP_XCADDY_MODULES="${XCADDY_ARGS}" \
               EMBED=dist/app/ \
               ./build-static.sh
           DOCKERFILE_END
       
       # ------------------------------------------------------------
-      # 步骤 6：使用 docker build 构建（官方推荐方式）
+      # 步骤 5：使用 docker build 构建（官方推荐方式）
       # ------------------------------------------------------------
       - name: 构建 FrankenPHP 静态二进制
         run: |
@@ -172,7 +170,7 @@ jobs:
             -f Dockerfile .
       
       # ------------------------------------------------------------
-      # 步骤 7：从 Docker 镜像中提取二进制文件
+      # 步骤 6：从 Docker 镜像中提取二进制文件
       # 官方提取方式：docker cp + docker rm
       # ------------------------------------------------------------
       - name: 提取二进制文件
@@ -199,7 +197,8 @@ jobs:
           file "./out/${{ matrix.output_name }}"
       
       # ------------------------------------------------------------
-      # 步骤 8：验证 PHP 运行时和扩展
+      # 步骤 7：验证 PHP 运行时和扩展
+      # 修正：php-cli -m 在 PHP < 8.6 不可用，改用 PHP 脚本检查
       # ------------------------------------------------------------
       - name: 验证 PHP 扩展
         run: |
@@ -210,27 +209,28 @@ jobs:
           
           echo ""
           echo "=== 验证 PHP 扩展 ==="
-          EXTENSIONS=$($BINARY php-cli -m)
           
-          MISSING=()
-          IFS=',' read -ra REQUIRED <<< "${{ inputs.php_extensions }}"
-          for ext in "${REQUIRED[@]}"; do
-            if echo "$EXTENSIONS" | grep -qi "^${ext}$"; then
-              echo "✓ $ext"
-            else
-              echo "✗ $ext (缺失)"
-              MISSING+=("$ext")
-            fi
-          done
+          # 创建扩展检查脚本
+          cat > /tmp/check-ext.php << 'PHPEOF'
+          <?php
+          $need = ["opcache","pdo_sqlite","sqlite3","curl","mbstring","gd","zip",
+                   "openssl","fileinfo","dom","iconv","exif"];
+          // true = 只检查 Zend 扩展（opcache 在这里）
+          $have = array_map("strtolower", get_loaded_extensions(true));
+          $miss = array_values(array_diff($need, $have));
+          echo "PHP ", PHP_VERSION, "\n";
+          echo "已装 ", count($have), " 个 Zend 扩展\n";
+          if ($miss) {
+              echo "缺少：", implode(", ", $miss), "\n";
+              exit(1);
+          }
+          echo "扩展齐全\n";
+          PHPEOF
           
-          if [ ${#MISSING[@]} -ne 0 ]; then
-            echo ""
-            echo "错误：以下扩展缺失：${MISSING[*]}"
-            exit 1
-          fi
+          $BINARY php-cli /tmp/check-ext.php
       
       # ------------------------------------------------------------
-      # 步骤 9：验证 Caddy 模块
+      # 步骤 8：验证 Caddy 模块
       # ------------------------------------------------------------
       - name: 验证 Caddy 模块
         run: |
@@ -258,14 +258,28 @@ jobs:
           fi
       
       # ------------------------------------------------------------
-      # 步骤 10：功能测试
+      # 步骤 9：功能测试
+      # 修正：使用 run 命令 + 自定义 Caddyfile，确保 Brotli 真正工作
       # ------------------------------------------------------------
       - name: 功能测试
         run: |
           BINARY="./out/${{ matrix.output_name }}"
           
+          # 创建测试用 Caddyfile（明确启用 Brotli 压缩）
+          cat > /tmp/Caddyfile.test << 'EOF'
+          {
+              auto_https off
+              admin off
+          }
+          :8080 {
+              root * dist/app/public
+              encode gzip br
+              php_server
+          }
+          EOF
+          
           echo "=== 启动 HTTP 服务 ==="
-          $BINARY php-server --root dist/app/public &
+          $BINARY run --config /tmp/Caddyfile.test &
           SERVER_PID=$!
           sleep 3
           
@@ -305,7 +319,7 @@ jobs:
           echo "✓ 功能测试完成"
       
       # ------------------------------------------------------------
-      # 步骤 11：上传构建产物
+      # 步骤 10：上传构建产物
       # ------------------------------------------------------------
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
@@ -324,6 +338,10 @@ jobs:
     if: ${{ always() && contains(needs.build.result, 'success') }}
     
     steps:
+      # 修正：需要 checkout 才能使用 git 命令
+      - name: 检出仓库
+        uses: actions/checkout@v4
+      
       - name: 下载构建产物
         uses: actions/download-artifact@v4
         with:
