@@ -111,12 +111,16 @@ jobs:
 
       - name: 自检 —— 二进制能不能跑，扩展齐不齐
         # 注意：不能用 `php-cli -m`，FrankenPHP 的这个参数要求 PHP >= 8.6
-        # 所以改成写一个 .php 文件让 php-cli 去跑
+        #
+        # 需要的扩展清单**从 PHP_EXTENSIONS 自动生成** ——
+        # 之前这里手写了一份副本，结果 check.php 里删掉 session 后忘了同步，
+        # 白白失败了一次。现在只有一个来源，不可能再对不上。
         run: |
           set -euxo pipefail
           ./frankenphp-linux-x86_64 version
 
-          echo '<?php $need=["pdo_sqlite","sqlite3","curl","mbstring","gd","zip","openssl","fileinfo","dom","json","session"]; $have=array_map("strtolower",get_loaded_extensions()); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "已装扩展 ",count($have)," 个\n"; if($miss){echo "缺少：",implode(", ",$miss),"\n"; exit(1);} echo "需要的扩展全都在\n";' > /tmp/check.php
+          NEED=$(printf '%s' "$PHP_EXTENSIONS" | tr -d ' \n' | sed 's/,/","/g')
+          echo '<?php $need=["'"$NEED"'"]; $have=array_map("strtolower",get_loaded_extensions()); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "已装扩展 ",count($have)," 个\n"; if($miss){echo "缺少：",implode(", ",$miss),"\n"; exit(1);} echo "需要的扩展全都在\n";' > /tmp/check.php
 
           ./frankenphp-linux-x86_64 php-cli /tmp/check.php
 
