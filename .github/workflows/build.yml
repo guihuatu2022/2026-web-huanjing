@@ -18,9 +18,11 @@
 #   PHP 要从源码编译，会慢到几小时甚至超时。两个原生运行器并行更快。
 #
 #  ── 踩过的四个坑（都写在这里，免得下次再犯）────────────────────────
-#    1. XCADDY_ARGS 一旦自定义，就会覆盖掉 FrankenPHP 自带的默认模块。
-#       如果你不加回 caddy-cbrotli，php-server 会报
-#       "module not registered: http.encoders.br" 直接起不来。
+#    1. XCADDY_ARGS 一旦自定义，就会覆盖掉 FrankenPHP 自带的默认模块
+#       （默认是 caddy-cbrotli + mercure + vulcain）。不加回 caddy-cbrotli，
+#       php-server 会报 "module not registered: http.encoders.br" 直接起不来。
+#    1b. docker cp 不能整个 dist 目录复制 —— 里面有 Go 的只读模块缓存，
+#       复制时会报 permission denied。只取成品那一个文件（已这么改）。
 #    2. `php-cli -m` 这个参数要求 PHP >= 8.6，8.3 用不了。
 #       要列扩展就写个 .php 文件让 php-cli 去跑。
 #    3. `get_loaded_extensions()` 必须传 true，否则 opcache 这类
@@ -59,13 +61,20 @@ on:
         default: 'libjpeg,libwebp,freetype'
 
       # ── Caddy 模块 ─────────────────────────────────────────
-      # 每个 --with 一行。注意 caddy-cbrotli 别删（见文件头的坑 1）
+      # 每个 --with 一行。两个注意点：
+      #
+      #  1. caddy-cbrotli 别删 —— 它是官方默认模块，删了 php-server 起不来
+      #
+      #  2. naiveproxy 那个模块默认**没有**加，因为它是个第三方分支
+      #     （github.com/klzgrad/forwardproxy@naive），跟 Caddy 主干同步靠人维护。
+      #     实测同一个模块集在 amd64 能过、在 arm64 编不过。
+      #     真要用 naiveproxy 时再手动加上这一行：
+      #       --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive
       xcaddy_args:
         description: 'Caddy 额外模块（xcaddy 的 --with 参数，可多行）'
         required: true
         default: >-
           --with github.com/dunglas/caddy-cbrotli
-          --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive
           --with github.com/caddy-dns/cloudflare
 
       # ── 构建目标 ───────────────────────────────────────────
@@ -185,20 +194,35 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # 扩展可选库留空时就不要传这个参数了 ——
+          # 扩展可选库留空时就不要传这个参数 ——
           # 传一个空值的 --set 可能让 bake 报错
           LIBS_SET=""
           if [ -n "${IN_PHP_EXTENSION_LIBS:-}" ]; then
             LIBS_SET="--set static-builder-gnu.args.PHP_EXTENSION_LIBS=${IN_PHP_EXTENSION_LIBS}"
           fi
 
-          docker buildx bake --load \
-            --set static-builder-gnu.platform=${{ matrix.platform }} \
-            --set static-builder-gnu.args.PHP_EXTENSIONS="${IN_PHP_EXTENSIONS}" \
-            ${LIBS_SET} \
-            --set static-builder-gnu.args.XCADDY_ARGS="${IN_XCADDY_ARGS}" \
-            --set static-builder-gnu.args.PHP_VERSION="${IN_PHP_VERSION}" \
-            static-builder-gnu
+          bake () {
+            docker buildx bake --load \
+              --set static-builder-gnu.platform=${{ matrix.platform }} \
+              --set static-builder-gnu.args.PHP_EXTENSIONS="${IN_PHP_EXTENSIONS}" \
+              ${LIBS_SET} \
+              --set static-builder-gnu.args.XCADDY_ARGS="${IN_XCADDY_ARGS}" \
+              --set static-builder-gnu.args.PHP_VERSION="${IN_PHP_VERSION}" \
+              $1 \
+              static-builder-gnu
+          }
+
+          # 第一次正常构建；失败了自动重试一次。
+          # 重试时加 --debug —— 因为 static-php-cli 默认会把真正的报错
+          # 藏进容器里的日志文件，构建一失败容器就没了，什么都看不到。
+          # 加 --debug 才会把详细输出打到控制台。
+          if bake ""; then
+            echo "✓ 第一次构建成功"
+          else
+            echo "⚠ 第一次构建失败，60 秒后自动重试一次（这次会带 --debug）"
+            sleep 60
+            bake "--set static-builder-gnu.args.SPC_OPT_BUILD_ARGS=--debug"
+          fi
 
       # ── 2. 取出二进制 ────────────────────────────────────
       # 镜像里的文件名是 frankenphp-linux-$(uname -m)，
@@ -208,13 +232,26 @@ jobs:
           set -euxo pipefail
           docker create --name sb dunglas/frankenphp:static-builder-gnu
           mkdir -p out
-          docker cp sb:/go/src/app/dist/. ./out/
+
+          # ★ 这一行是关键：只取出成品那一个文件，不要复制整个 dist/。
+          #
+          # 【为什么不能复制整个 dist/】
+          # dist/ 里面含着 Go 的模块缓存，那些目录 Go 故意设成**只读**
+          # （防止构建过程中被改动）。docker cp 会把权限一起复制过去 ——
+          # 先把目录建成只读的，再往里写文件就被自己挡住了，报：
+          #   open .../go/pkg/mod/cel.dev/expr@v0.25.1/.bazelversion: permission denied
+          # 这个报错跟构建毫无关系，纯粹是复制方式不对。
+          #
+          # 【成品在哪】
+          # 来自 build-static.sh 最后两行：
+          #   bin="dist/frankenphp-${os}-${arch}"
+          #   cp "dist/static-php-cli/buildroot/bin/frankenphp" "${bin}"
+          ARCH_NOW=$(uname -m)
+          docker cp "sb:/go/src/app/dist/frankenphp-linux-${ARCH_NOW}" \
+                    "out/frankenphp-linux-${ARCH_NOW}"
           docker rm sb
 
-          echo "镜像 dist 目录："
-          ls -la out/
-
-          # 先找顶层（正常情况下就在这），找不到再往子目录找
+          # 下面这段是原来就有的，不用动
           SRC=$(find out -maxdepth 1 -type f -name 'frankenphp-linux-*' | head -1)
           [ -z "$SRC" ] && SRC=$(find out -type f -name 'frankenphp-linux-*' | head -1)
           if [ -z "$SRC" ]; then
