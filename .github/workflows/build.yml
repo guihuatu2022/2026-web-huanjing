@@ -216,8 +216,11 @@ jobs:
       #  with a php version less than 8.6"。
       #  改成写一个 .php 文件让 php-cli 去跑。
       #
-      #  get_loaded_extensions() 必须传 true：
-      #  opcache 属于 Zend 扩展，不传 true 时不在返回列表里，会误报缺失。
+      #  ★ get_loaded_extensions(true) 只列 Zend 扩展，不是"普通+Zend"。
+      #    PHP 官方确认过这是文档没写清楚的行为：
+      #    https://bugs.php.net/bug.php?id=52715
+      #    所以这里用不带参数的 get_loaded_extensions()（它已经包含 opcache，
+      #    名字是 "Zend OPcache"），再把 "zend " 前缀去掉对上 opcache。
       # ────────────────────────────────────────────────────────────────
       - name: 自检 A —— PHP 与扩展
         run: |
@@ -225,7 +228,7 @@ jobs:
           ./${{ matrix.binary }} version
 
           NEED=$(printf '%s' "$IN_PHP_EXTENSIONS" | tr -d ' \n' | sed 's/,/","/g')
-          echo '<?php $need=["'"$NEED"'"]; $have=array_map("strtolower",get_loaded_extensions(true)); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "实际装了 ",count($have)," 个扩展：\n  ",implode(", ",$have),"\n"; if($miss){echo "缺少：",implode(", ",$miss),"\n"; exit(1);} echo "扩展齐全\n";' > /tmp/check.php
+          echo '<?php $need=["'"$NEED"'"]; $have=array_map(function($e){return str_replace("zend ","",strtolower($e));},get_loaded_extensions()); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "实际装了 ",count($have)," 个扩展：\n  ",implode(", ",$have),"\n"; if($miss){echo "缺少：",implode(", ",$miss),"\n"; exit(1);} echo "扩展齐全\n";' > /tmp/check.php
 
           ./${{ matrix.binary }} php-cli /tmp/check.php
 
@@ -238,7 +241,10 @@ jobs:
       - name: 自检 B —— Caddy 模块
         run: |
           set -euxo pipefail
-          ./${{ matrix.binary }} list-modules > /tmp/modules.txt
+          # 去掉每行首尾空白 —— grep -qxF 要求整行完全相等，
+          # 万一输出带了空格就会误判成"缺失"
+          ./${{ matrix.binary }} list-modules \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' > /tmp/modules.txt
           echo "模块总数：$(wc -l < /tmp/modules.txt)"
 
           want () {
@@ -277,7 +283,9 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p /tmp/webroot
-          printf '%s\n' '<?php echo "OK ", PHP_VERSION, " ", PHP_SAPI;' > /tmp/webroot/index.php
+          # 页面要够大（>512 字节）压缩器才会动手 —— Caddy 对太小的响应
+          # 默认不压缩。之前用 22 字节的页面测 brotli，永远测不出来。
+          printf '%s\n' '<?php echo "OK ", PHP_VERSION, " ", PHP_SAPI, "\n"; echo str_repeat("压缩测试 compressible payload ", 400);' > /tmp/webroot/index.php
 
           printf '%s\n' \
             '{' \
@@ -290,9 +298,13 @@ jobs:
             '    php_server' \
             '}' > /tmp/Caddyfile.test
 
-          ./${{ matrix.binary }} validate --config /tmp/Caddyfile.test
+          # 显式指定 --adapter caddyfile。
+          # 文件名是 Caddyfile.test，扩展名 .test 不在 Caddy 的识别范围内，
+          # 不写适配器它有可能会猜错。
+          ./${{ matrix.binary }} validate --config /tmp/Caddyfile.test --adapter caddyfile
 
-          ./${{ matrix.binary }} run --config /tmp/Caddyfile.test > /tmp/server.log 2>&1 &
+          ./${{ matrix.binary }} run --config /tmp/Caddyfile.test --adapter caddyfile \
+            > /tmp/server.log 2>&1 &
           SRV=$!
 
           ok=0
@@ -315,7 +327,9 @@ jobs:
           fi
           echo "PHP 返回：$(cat /tmp/out.txt)"
 
-          # 真正压一次 brotli（Accept-Encoding: br）
+          # 真正压一次 brotli。
+          # 注意：这不是硬性判定 —— 缺 br 的话上面 validate 那步已经先失败了。
+          # 这里只是把结果打出来，方便看日志。
           ENC=$(curl -s -H 'Accept-Encoding: br' -D - -o /dev/null \
                   http://127.0.0.1:18080/ 2>/dev/null | tr -d '\r' \
                   | grep -i '^content-encoding' || true)
