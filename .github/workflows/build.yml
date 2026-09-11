@@ -120,7 +120,12 @@ jobs:
           ./frankenphp-linux-x86_64 version
 
           NEED=$(printf '%s' "$PHP_EXTENSIONS" | tr -d ' \n' | sed 's/,/","/g')
-          echo '<?php $need=["'"$NEED"'"]; $have=array_map("strtolower",get_loaded_extensions()); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "已装扩展 ",count($have)," 个\n"; if($miss){echo "缺少：",implode(", ",$miss),"\n"; exit(1);} echo "需要的扩展全都在\n";' > /tmp/check.php
+          # 两个要点：
+          #   1) get_loaded_extensions(true) —— 必须传 true，
+          #      否则 opcache 这类 Zend 扩展不在列表里，会误报"缺少"
+          #   2) 无条件把实际扩展全打印出来 —— 万一以后又不匹配，
+          #      看日志一眼就知道真实情况，不用再猜一轮
+          echo '<?php $need=["'"$NEED"'"]; $have=array_map("strtolower",get_loaded_extensions(true)); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "实际装了 ",count($have)," 个扩展：\n  ",implode(", ",$have),"\n"; if($miss){echo "✗ 缺少：",implode(", ",$miss),"\n"; exit(1);} echo "✓ 需要的扩展全都在\n";' > /tmp/check.php
 
           ./frankenphp-linux-x86_64 php-cli /tmp/check.php
 
