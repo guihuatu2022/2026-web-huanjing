@@ -1,415 +1,380 @@
-# ============================================================================
-#  构建「自带 PHP 的单文件」运行时
+# FrankenPHP 单文件运行时构建工作流
+# 产物：frankenphp-linux-x86_64 和 frankenphp-linux-aarch64
+# 包含：PHP 8.3 + 指定扩展 + Caddy + 指定模块
 #
-#  ── 这是一个通用工作流 ──────────────────────────────────────────────
-#  不针对任何特定项目。所有可调项都在 workflow_dispatch 的输入里，
-#  直接把这个文件复制到别的仓库、点一下 → 就能构建出同样的东西。
-#
-#  产物：单个可执行文件，内含
-#     · Caddy 网页服务器
-#     · PHP 运行时（版本和扩展由你指定）
-#     · 你指定要编进去的 Caddy 模块
-#
-#  ── 两种架构，都用原生运行器 ────────────────────────────────────────
-#     frankenphp-linux-x86_64    ← Intel / AMD（ubuntu-latest）
-#     frankenphp-linux-aarch64   ← ARM（ubuntu-24.04-arm，公开仓库免费）
-#
-#   为什么不交叉编译：在 amd64 上用 QEMU 模拟编 arm64，
-#   PHP 要从源码编译，会慢到几小时甚至超时。两个原生运行器并行更快。
-#
-#  ── 踩过的四个坑（都写在这里，免得下次再犯）────────────────────────
-#    1. XCADDY_ARGS 一旦自定义，就会覆盖掉 FrankenPHP 自带的默认模块
-#       （默认是 caddy-cbrotli + mercure + vulcain）。不加回 caddy-cbrotli，
-#       php-server 会报 "module not registered: http.encoders.br" 直接起不来。
-#    1b. docker cp 不能整个 dist 目录复制 —— 里面有 Go 的只读模块缓存，
-#       复制时会报 permission denied。只取成品那一个文件（已这么改）。
-#    2. `php-cli -m` 这个参数要求 PHP >= 8.6，8.3 用不了。
-#       要列扩展就写个 .php 文件让 php-cli 去跑。
-#    3. `get_loaded_extensions()` 必须传 true，否则 opcache 这类
-#       Zend 扩展不在列表里，会误报"缺少"。
-#    4. 需要的扩展清单从 PHP_EXTENSIONS 自动生成，不要在第二处再写一遍。
-#
-#  ── 内存 ──────────────────────────────────────────────────────────
-#    默认这套扩展实测：刚启动 72.8 MB，并发后 79.6 MB。
-#    · 256 MB 容器：舒服
-#    · 128 MB 容器：能跑，但要把 PHP 的 memory_limit 调到 48M 以下，
-#      否则单个请求吃满内存会把容器撑爆
-#    想更省就把用不到的扩展去掉（gd 最重，会连带加载 4 个图像库）
-# ============================================================================
+# 参考官方文档：https://frankenphp.dev/zh/docs/embed/
 
-name: 构建 PHP 运行时单文件
+name: Build FrankenPHP Static Binary
 
 on:
   workflow_dispatch:
     inputs:
-
-      # ── PHP ────────────────────────────────────────────────
       php_version:
-        description: 'PHP 版本（8.2 / 8.3 / 8.4 / 8.5）'
+        description: 'PHP 版本'
         required: true
         default: '8.3'
-
+      
       php_extensions:
-        description: '要编进 PHP 的扩展（逗号分隔，不需要的删掉能省内存）'
+        description: 'PHP 扩展（逗号分隔）'
         required: true
-        default: >-
-          opcache,pdo_sqlite,sqlite3,curl,mbstring,gd,zip,openssl,fileinfo,dom,iconv,exif
-
+        default: 'opcache,pdo_sqlite,sqlite3,curl,mbstring,gd,zip,openssl,fileinfo,dom,iconv,exif'
+      
       php_extension_libs:
-        description: '扩展的可选依赖库（gd 需要 libwebp/freetype，否则处理不了 WebP、也没法在图上写中文）'
-        required: false
+        description: '扩展依赖库（逗号分隔）'
+        required: true
         default: 'libjpeg,libwebp,freetype'
-
-      # ── Caddy 模块 ─────────────────────────────────────────
-      # 每个 --with 一行。两个注意点：
-      #
-      #  1. caddy-cbrotli 别删 —— 它是官方默认模块，删了 php-server 起不来
-      #
-      #  2. naiveproxy 那个模块默认**没有**加，因为它是个第三方分支
-      #     （github.com/klzgrad/forwardproxy@naive），跟 Caddy 主干同步靠人维护。
-      #     实测同一个模块集在 amd64 能过、在 arm64 编不过。
-      #     真要用 naiveproxy 时再手动加上这一行：
-      #       --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive
-      xcaddy_args:
-        description: 'Caddy 额外模块（xcaddy 的 --with 参数，可多行）'
+      
+      caddy_modules:
+        description: 'Caddy 模块（逗号分隔，格式：module=repo@version 或 repo）'
         required: true
-        default: >-
-          --with github.com/dunglas/caddy-cbrotli
-          --with github.com/caddy-dns/cloudflare
-
-      # ── 构建目标 ───────────────────────────────────────────
-      build_arch:
-        description: '构建哪些架构'
+        default: 'github.com/dunglas/caddy-cbrotli,github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive,github.com/caddy-dns/cloudflare'
+      
+      architectures:
+        description: '构建架构（both / amd64 / arm64）'
         required: true
-        type: choice
-        default: both
-        options:
-          - both
-          - amd64
-          - arm64
-
+        default: 'both'
+      
       release_tag:
-        description: 'Release 标签（留空则自动用 build-<运行号>）'
+        description: 'Release 标签（留空则自动生成）'
         required: false
         default: ''
 
-permissions:
-  contents: write
-
 jobs:
-
-  # ══════════════════════════════════════════════════════════
-  #  准备：根据 build_arch 生成构建矩阵
-  #  （矩阵要动态生成，所以拆一个前置任务出来）
-  # ══════════════════════════════════════════════════════════
-  prepare:
-    name: 准备
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
-      tag:    ${{ steps.gen.outputs.tag }}
-    steps:
-      - name: 生成构建矩阵
-        id: gen
-        run: |
-          set -euxo pipefail
-
-          AMD='{"arch":"amd64","runner":"ubuntu-latest","platform":"linux/amd64","binary":"frankenphp-linux-x86_64"}'
-          ARM='{"arch":"arm64","runner":"ubuntu-24.04-arm","platform":"linux/arm64","binary":"frankenphp-linux-aarch64"}'
-
-          case "${{ inputs.build_arch }}" in
-            amd64) M="[$AMD]" ;;
-            arm64) M="[$ARM]" ;;
-            both)  M="[$AMD,$ARM]" ;;
-            *)     echo "✗ build_arch 只能是 both / amd64 / arm64，收到：${{ inputs.build_arch }}"; exit 1 ;;
-          esac
-
-          echo "matrix=$M" >> "$GITHUB_OUTPUT"
-
-          TAG="${{ inputs.release_tag }}"
-          [ -z "$TAG" ] && TAG="build-${{ github.run_number }}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-          echo "构建矩阵：$M"
-          echo "Release 标签：$TAG"
-
-      - name: 打印本次配置（留在构建日志里，方便以后回查）
-        run: |
-          echo "════════════════════════════════════════════════"
-          echo "  本次构建配置"
-          echo "════════════════════════════════════════════════"
-          echo "  PHP 版本   : ${{ inputs.php_version }}"
-          echo "  PHP 扩展   : ${{ inputs.php_extensions }}"
-          echo "  扩展可选库 : ${{ inputs.php_extension_libs }}"
-          echo "  架构       : ${{ inputs.build_arch }}"
-          echo "  Caddy 模块 :"
-          printf '%s\n' "${{ inputs.xcaddy_args }}" | sed 's/^/      /'
-          echo "════════════════════════════════════════════════"
-
-  # ══════════════════════════════════════════════════════════
-  #  构建
-  # ══════════════════════════════════════════════════════════
+  # ============================================================
+  # 构建任务：为指定架构编译 FrankenPHP 静态二进制
+  # ============================================================
   build:
-    name: 构建 ${{ matrix.arch }}
-    needs: prepare
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 240
-
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    
     strategy:
-      fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-
-    env:
-      # 输入统一转成环境变量，后面所有步骤都用这几个名字
-      IN_PHP_VERSION:        ${{ inputs.php_version }}
-      IN_PHP_EXTENSIONS:     ${{ inputs.php_extensions }}
-      IN_PHP_EXTENSION_LIBS: ${{ inputs.php_extension_libs }}
-      IN_XCADDY_ARGS:        ${{ inputs.xcaddy_args }}
-
+        include:
+          - when: ${{ inputs.architectures == 'both' || inputs.architectures == 'amd64' }}
+            arch: amd64
+            platform: linux/amd64
+            output_name: frankenphp-linux-x86_64
+          - when: ${{ inputs.architectures == 'both' || inputs.architectures == 'arm64' }}
+            arch: arm64
+            platform: linux/arm64
+            output_name: frankenphp-linux-aarch64
+        exclude:
+          - when: false
+    
     steps:
-
-      # ── 0. 先确认运行器本身可用 ──────────────────────────
-      # 放第一步：环境有问题立刻失败，不浪费后面那十几分钟
-      - name: 检查运行器环境
+      # ------------------------------------------------------------
+      # 步骤 1：检出代码仓库
+      # ------------------------------------------------------------
+      - name: 检出仓库
+        uses: actions/checkout@v4
+      
+      # ------------------------------------------------------------
+      # 步骤 2：设置 QEMU（用于跨平台构建）
+      # 当构建 arm64 时需要 QEMU 模拟器
+      # ------------------------------------------------------------
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+        if: ${{ matrix.arch == 'arm64' }}
+      
+      # ------------------------------------------------------------
+      # 步骤 3：准备应用目录结构
+      # FrankenPHP 静态构建器要求应用代码放在 /go/src/app/dist/app
+      # ------------------------------------------------------------
+      - name: 准备应用目录
         run: |
-          set -euxo pipefail
-          echo "架构：$(uname -m)   核数：$(nproc)"
-          docker version
-          docker buildx version
-          df -h / | tail -1
-
-      - name: 拉取 FrankenPHP 源码（构建脚本在里面）
-        run: git clone --depth 1 https://github.com/php/frankenphp.git
-
-      - name: 配置 Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # ── 1. 构建 ──────────────────────────────────────────
-      - name: 构建单文件
-        working-directory: frankenphp
-        env:
-          # 构建过程要从 GitHub 拉 Go 模块，带上 token 免得撞速率限制
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euxo pipefail
-
-          # 扩展可选库留空时就不要传这个参数 ——
-          # 传一个空值的 --set 可能让 bake 报错
-          LIBS_SET=""
-          if [ -n "${IN_PHP_EXTENSION_LIBS:-}" ]; then
-            LIBS_SET="--set static-builder-gnu.args.PHP_EXTENSION_LIBS=${IN_PHP_EXTENSION_LIBS}"
-          fi
-
-          bake () {
-            docker buildx bake --load \
-              --set static-builder-gnu.platform=${{ matrix.platform }} \
-              --set static-builder-gnu.args.PHP_EXTENSIONS="${IN_PHP_EXTENSIONS}" \
-              ${LIBS_SET} \
-              --set static-builder-gnu.args.XCADDY_ARGS="${IN_XCADDY_ARGS}" \
-              --set static-builder-gnu.args.PHP_VERSION="${IN_PHP_VERSION}" \
-              $1 \
-              static-builder-gnu
+          mkdir -p dist/app/public
+          
+          cat > dist/app/public/index.php << 'EOF'
+          <?php
+          phpinfo();
+          EOF
+          
+          cat > dist/app/Caddyfile << 'EOF'
+          {
+              auto_https off
           }
-
-          # 第一次正常构建；失败了自动重试一次。
-          # 重试时加 --debug —— 因为 static-php-cli 默认会把真正的报错
-          # 藏进容器里的日志文件，构建一失败容器就没了，什么都看不到。
-          # 加 --debug 才会把详细输出打到控制台。
-          if bake ""; then
-            echo "✓ 第一次构建成功"
-          else
-            echo "⚠ 第一次构建失败，60 秒后自动重试一次（这次会带 --debug）"
-            sleep 60
-            bake "--set static-builder-gnu.args.SPC_OPT_BUILD_ARGS=--debug"
-          fi
-
-      # ── 2. 取出二进制 ────────────────────────────────────
-      # 镜像里的文件名是 frankenphp-linux-$(uname -m)，
-      # 用 find 找出来再改成固定名字，不依赖命名细节
-      - name: 取出二进制
-        run: |
-          set -euxo pipefail
-          docker create --name sb dunglas/frankenphp:static-builder-gnu
-          mkdir -p out
-
-          # ★ 这一行是关键：只取出成品那一个文件，不要复制整个 dist/。
-          #
-          # 【为什么不能复制整个 dist/】
-          # dist/ 里面含着 Go 的模块缓存，那些目录 Go 故意设成**只读**
-          # （防止构建过程中被改动）。docker cp 会把权限一起复制过去 ——
-          # 先把目录建成只读的，再往里写文件就被自己挡住了，报：
-          #   open .../go/pkg/mod/cel.dev/expr@v0.25.1/.bazelversion: permission denied
-          # 这个报错跟构建毫无关系，纯粹是复制方式不对。
-          #
-          # 【成品在哪】
-          # 来自 build-static.sh 最后两行：
-          #   bin="dist/frankenphp-${os}-${arch}"
-          #   cp "dist/static-php-cli/buildroot/bin/frankenphp" "${bin}"
-          ARCH_NOW=$(uname -m)
-          docker cp "sb:/go/src/app/dist/frankenphp-linux-${ARCH_NOW}" \
-                    "out/frankenphp-linux-${ARCH_NOW}"
-          docker rm sb
-
-          # 下面这段是原来就有的，不用动
-          SRC=$(find out -maxdepth 1 -type f -name 'frankenphp-linux-*' | head -1)
-          [ -z "$SRC" ] && SRC=$(find out -type f -name 'frankenphp-linux-*' | head -1)
-          if [ -z "$SRC" ]; then
-            echo "✗ dist 里没找到 frankenphp-linux-* 文件，实际内容："
-            find out -type f | head -50
-            exit 1
-          fi
-
-          mv "$SRC" "${{ matrix.binary }}"
-          chmod +x "${{ matrix.binary }}"
-          ls -lh "${{ matrix.binary }}"
-
-      # ── 3. 自检 A：PHP 能跑、扩展齐 ──────────────────────
-      # 清单从 IN_PHP_EXTENSIONS 生成，不写第二份
-      # get_loaded_extensions(true) 的 true 是关键（见文件头坑 3）
-      # 不管成功失败都列出实际装了什么
-      - name: 自检 A —— PHP 与扩展
-        run: |
-          set -euxo pipefail
-          ./${{ matrix.binary }} version
-
-          NEED=$(printf '%s' "$IN_PHP_EXTENSIONS" | tr -d ' \n' | sed 's/,/","/g')
-          echo '<?php $need=["'"$NEED"'"]; $have=array_map("strtolower",get_loaded_extensions(true)); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "实际装了 ",count($have)," 个扩展：\n  ",implode(", ",$have),"\n"; if($miss){echo "✗ 缺少：",implode(", ",$miss),"\n"; exit(1);} echo "✓ 需要的扩展全都在\n";' > /tmp/check.php
-
-          ./${{ matrix.binary }} php-cli /tmp/check.php
-
-      # ── 4. 自检 B：Caddy 模块 ────────────────────────────
-      # 只检查"你确实请求了、但可能没编进去"的那些模块
-      # -F 是关键：模块名里的 `.` 不加 -F 会被当正则"任意字符"
-      - name: 自检 B —— Caddy 模块
-        run: |
-          set -euxo pipefail
-          ./${{ matrix.binary }} list-modules > /tmp/modules.txt
-          echo "模块总数：$(wc -l < /tmp/modules.txt)"
-
-          need_check() {
-            case "$1" in
-              http.encoders.br)            printf '%s' "$IN_XCADDY_ARGS" | grep -q 'caddy-cbrotli' ;;
-              http.handlers.forward_proxy) printf '%s' "$IN_XCADDY_ARGS" | grep -q 'forwardproxy' ;;
-              dns.providers.cloudflare)    printf '%s' "$IN_XCADDY_ARGS" | grep -q 'cloudflare' ;;
-              *) return 1 ;;
-            esac
+          
+          :80 {
+              root * /app/public
+              php_server
           }
-
-          fail=0
-          for m in http.encoders.br http.handlers.forward_proxy dns.providers.cloudflare; do
-            if ! need_check "$m"; then
-              echo "· $m —— 本次没有请求，跳过"
-              continue
-            fi
-            if grep -qxF "$m" /tmp/modules.txt; then
-              echo "✓ $m"
+          EOF
+      
+      # ------------------------------------------------------------
+      # 步骤 4：准备 PHP 扩展和 Caddy 模块参数
+      # ------------------------------------------------------------
+      - name: 准备构建参数
+        id: params
+        run: |
+          # 将 PHP 扩展从逗号分隔转换为空格分隔
+          PHP_EXT=$(echo "${{ inputs.php_extensions }}" | tr ',' ' ')
+          echo "php_extensions=$PHP_EXT" >> $GITHUB_OUTPUT
+          
+          # 将依赖库从逗号分隔转换为空格分隔
+          PHP_LIBS=$(echo "${{ inputs.php_extension_libs }}" | tr ',' ' ')
+          echo "php_extension_libs=$PHP_LIBS" >> $GITHUB_OUTPUT
+          
+          # 将 Caddy 模块转换为 xcaddy 格式（每个模块前加 --with）
+          CADDY_MODS=""
+          IFS=',' read -ra MODULES <<< "${{ inputs.caddy_modules }}"
+          for mod in "${MODULES[@]}"; do
+            if [[ "$mod" == *"="* ]]; then
+              mod_name="${mod%%=*}"
+              mod_repo="${mod#*=}"
+              CADDY_MODS="$CADDY_MODS --with $mod_name=$mod_repo"
             else
-              echo "✗ 请求了 $m 但没编进去"
-              fail=1
+              CADDY_MODS="$CADDY_MODS --with $mod"
             fi
           done
-
-          echo "--- 编码器 / 代理 / DNS 相关模块 ---"
-          grep -E 'encoders\.|forward_proxy|dns\.providers' /tmp/modules.txt || true
-          exit $fail
-
-      # ── 5. 自检 C：真起一个服务，并实测 brotli ───────────
-      # 前面都是"看名单"，这一步是"真跑一次"。
-      # 用 run --config 而不是 php-server：既走生产路径，又不用猜参数名。
-      # 配置里写了 encode gzip br —— 真压一次，能验证 brotli 确实工作
-      - name: 自检 C —— 起服务并实测压缩
+          echo "caddy_modules=$CADDY_MODS" >> $GITHUB_OUTPUT
+      
+      # ------------------------------------------------------------
+      # 步骤 5：创建 Dockerfile（根据官方文档）
+      # 参考：https://frankenphp.dev/zh/docs/embed/
+      # 
+      # 使用 ARG 声明构建参数，在 RUN 中作为环境变量传递给 build-static.sh
+      # ------------------------------------------------------------
+      - name: 创建 Dockerfile
         run: |
-          set -euxo pipefail
-          mkdir -p /tmp/webroot
-          printf '%s\n' '<?php echo "OK ", PHP_VERSION, " ", PHP_SAPI;' > /tmp/webroot/index.php
-
-          printf '%s\n' \
-            '{' \
-            '    auto_https off' \
-            '    admin off' \
-            '}' \
-            ':18080 {' \
-            '    root * /tmp/webroot' \
-            '    encode gzip br' \
-            '    php_server' \
-            '}' > /tmp/Caddyfile.test
-
-          echo "--- 测试配置 ---"
-          cat /tmp/Caddyfile.test
-          echo "--- 校验语法 ---"
-          ./${{ matrix.binary }} validate --config /tmp/Caddyfile.test
-
-          echo "--- 启动 ---"
-          ./${{ matrix.binary }} run --config /tmp/Caddyfile.test > /tmp/server.log 2>&1 &
-          SRV=$!
-
-          ok=0
-          for i in $(seq 1 30); do
-            sleep 1
-            if curl -fsS --max-time 3 http://127.0.0.1:18080/ > /tmp/out.txt 2>/dev/null; then
-              ok=1; break
+          cat > Dockerfile << 'DOCKERFILE_END'
+          ARG TARGETPLATFORM
+          FROM --platform=${TARGETPLATFORM} dunglas/frankenphp:static-builder-gnu
+          
+          ARG PHP_VERSION=8.3
+          ARG PHP_EXTENSIONS="opcache pdo_sqlite sqlite3 curl mbstring gd zip openssl fileinfo dom iconv exif"
+          ARG PHP_EXTENSION_LIBS="libjpeg libwebp freetype"
+          ARG XCADDY_ARGS=""
+          
+          WORKDIR /go/src/app/dist/app
+          COPY dist/app .
+          
+          WORKDIR /go/src/app/
+          RUN PHP_VERSION="${PHP_VERSION}" \
+              PHP_EXTENSIONS="${PHP_EXTENSIONS}" \
+              PHP_EXTENSION_LIBS="${PHP_EXTENSION_LIBS}" \
+              XCADDY_ARGS="${XCADDY_ARGS}" \
+              EMBED=dist/app/ \
+              ./build-static.sh
+          DOCKERFILE_END
+      
+      # ------------------------------------------------------------
+      # 步骤 6：使用 docker build 构建（官方推荐方式）
+      # ------------------------------------------------------------
+      - name: 构建 FrankenPHP 静态二进制
+        run: |
+          docker build \
+            --platform ${{ matrix.platform }} \
+            --build-arg PHP_VERSION="${{ inputs.php_version }}" \
+            --build-arg PHP_EXTENSIONS="${{ steps.params.outputs.php_extensions }}" \
+            --build-arg PHP_EXTENSION_LIBS="${{ steps.params.outputs.php_extension_libs }}" \
+            --build-arg XCADDY_ARGS="${{ steps.params.outputs.caddy_modules }}" \
+            -t frankenphp-builder \
+            -f Dockerfile .
+      
+      # ------------------------------------------------------------
+      # 步骤 7：从 Docker 镜像中提取二进制文件
+      # 官方提取方式：docker cp + docker rm
+      # ------------------------------------------------------------
+      - name: 提取二进制文件
+        run: |
+          mkdir -p out
+          
+          # 创建临时容器
+          CONTAINER_ID=$(docker create --platform ${{ matrix.platform }} frankenphp-builder)
+          
+          # 复制二进制文件（官方路径：/go/src/app/dist/frankenphp-linux-xxx）
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            BINARY_NAME="frankenphp-linux-x86_64"
+          else
+            BINARY_NAME="frankenphp-linux-aarch64"
+          fi
+          
+          docker cp "${CONTAINER_ID}:/go/src/app/dist/${BINARY_NAME}" "./out/${{ matrix.output_name }}"
+          docker rm "${CONTAINER_ID}"
+          
+          chmod +x "./out/${{ matrix.output_name }}"
+          
+          echo "✓ 二进制文件已生成："
+          ls -lh "./out/${{ matrix.output_name }}"
+          file "./out/${{ matrix.output_name }}"
+      
+      # ------------------------------------------------------------
+      # 步骤 8：验证 PHP 运行时和扩展
+      # ------------------------------------------------------------
+      - name: 验证 PHP 扩展
+        run: |
+          BINARY="./out/${{ matrix.output_name }}"
+          
+          echo "=== 验证 PHP 版本 ==="
+          $BINARY php-cli -v
+          
+          echo ""
+          echo "=== 验证 PHP 扩展 ==="
+          EXTENSIONS=$($BINARY php-cli -m)
+          
+          MISSING=()
+          IFS=',' read -ra REQUIRED <<< "${{ inputs.php_extensions }}"
+          for ext in "${REQUIRED[@]}"; do
+            if echo "$EXTENSIONS" | grep -qi "^${ext}$"; then
+              echo "✓ $ext"
+            else
+              echo "✗ $ext (缺失)"
+              MISSING+=("$ext")
             fi
           done
-
-          # 顺便记一下内存，供以后选容器规格参考。
-          # 注意：set -e + pipefail 下，ps 失败会让整个脚本提前退出，
-          # 所以必须加 || echo 0 兜底（这个坑实测过）
-          RSS=$(ps -o rss= -p $SRV 2>/dev/null | tr -d ' ' || echo 0)
-          [ -z "$RSS" ] && RSS=0
-
-          kill $SRV 2>/dev/null || true
-          wait $SRV 2>/dev/null || true
-
-          if [ "$ok" != "1" ]; then
-            echo "✗ 服务没起来，日志："
-            cat /tmp/server.log || true
+          
+          if [ ${#MISSING[@]} -ne 0 ]; then
+            echo ""
+            echo "错误：以下扩展缺失：${MISSING[*]}"
             exit 1
           fi
-
-          echo "PHP 返回：$(cat /tmp/out.txt)"
-          if [ "$RSS" != "0" ]; then
-            awk "BEGIN{printf \"内存占用：%.1f MB\n\", $RSS/1024}"
+      
+      # ------------------------------------------------------------
+      # 步骤 9：验证 Caddy 模块
+      # ------------------------------------------------------------
+      - name: 验证 Caddy 模块
+        run: |
+          BINARY="./out/${{ matrix.output_name }}"
+          
+          echo "=== 验证 Caddy 模块 ==="
+          MODULES=$($BINARY list-modules)
+          
+          MISSING=()
+          IFS=',' read -ra REQUIRED <<< "${{ inputs.caddy_modules }}"
+          for mod in "${REQUIRED[@]}"; do
+            mod_path="${mod%%=*}"
+            if echo "$MODULES" | grep -q "$mod_path"; then
+              echo "✓ $mod_path"
+            else
+              echo "✗ $mod_path (缺失)"
+              MISSING+=("$mod_path")
+            fi
+          done
+          
+          if [ ${#MISSING[@]} -ne 0 ]; then
+            echo ""
+            echo "错误：以下模块缺失：${MISSING[*]}"
+            exit 1
           fi
-          echo "--- 服务日志 ---"
-          cat /tmp/server.log || true
-
-      # ── 6. 上传 ──────────────────────────────────────────
-      # 两个都带 if: always() —— 跑了二十多分钟的产物，
-      # 不该因为某条自检失败就丢掉
-      - name: 上传为 Release 附件
-        if: always()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          name: ${{ needs.prepare.outputs.tag }}
-          body: |
-            自带 PHP 的单文件运行时。
-
-            | 文件 | 用在什么机器 |
-            |---|---|
-            | `frankenphp-linux-x86_64` | Intel / AMD |
-            | `frankenphp-linux-aarch64` | ARM（甲骨文免费机、树莓派等） |
-
-            用法：
-            ```bash
-            chmod +x frankenphp-linux-*
-            ./frankenphp-linux-x86_64 version
-            ./frankenphp-linux-x86_64 php-cli 某个脚本.php
-            ./frankenphp-linux-x86_64 php-server
-            ./frankenphp-linux-x86_64 run --config Caddyfile
-            ```
-
-            **内存参考**：默认扩展配置实测约 73 MB 起步、80 MB 并发后。
-            容器给 256 MB 舒服；给 128 MB 要把 PHP 的 `memory_limit` 调到 48M 以下
-            （配置文件放 `/etc/frankenphp/php.d/`）。
-          files: ${{ matrix.binary }}
-
-      - name: 也存一份 Artifact（Release 出问题时还能拿到）
-        if: always()
+      
+      # ------------------------------------------------------------
+      # 步骤 10：功能测试
+      # ------------------------------------------------------------
+      - name: 功能测试
+        run: |
+          BINARY="./out/${{ matrix.output_name }}"
+          
+          echo "=== 启动 HTTP 服务 ==="
+          $BINARY php-server --root dist/app/public &
+          SERVER_PID=$!
+          sleep 3
+          
+          echo ""
+          echo "=== 测试 HTTP 响应 ==="
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080)
+          if [ "$RESPONSE" = "200" ]; then
+            echo "✓ HTTP 服务正常响应 (状态码：$RESPONSE)"
+          else
+            echo "✗ HTTP 服务响应异常 (状态码：$RESPONSE)"
+            kill $SERVER_PID || true
+            exit 1
+          fi
+          
+          echo ""
+          echo "=== 测试 PHP 页面内容 ==="
+          CONTENT=$(curl -s http://localhost:8080)
+          if echo "$CONTENT" | grep -q "PHP Version"; then
+            echo "✓ PHP 页面正常渲染"
+          else
+            echo "✗ PHP 页面渲染异常"
+            kill $SERVER_PID || true
+            exit 1
+          fi
+          
+          echo ""
+          echo "=== 测试 Brotli 压缩 ==="
+          ENCODING=$(curl -s -H "Accept-Encoding: br" -D - http://localhost:8080 | grep -i "content-encoding" | tr -d '\r')
+          if echo "$ENCODING" | grep -qi "br"; then
+            echo "✓ Brotli 压缩已启用 ($ENCODING)"
+          else
+            echo "⚠ Brotli 压缩未检测到 ($ENCODING)"
+          fi
+          
+          kill $SERVER_PID || true
+          echo ""
+          echo "✓ 功能测试完成"
+      
+      # ------------------------------------------------------------
+      # 步骤 11：上传构建产物
+      # ------------------------------------------------------------
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.binary }}
-          path: ${{ matrix.binary }}
+          name: ${{ matrix.output_name }}
+          path: out/${{ matrix.output_name }}
           retention-days: 30
-          if-no-files-found: warn
+          if-no-files-found: error
+  
+  # ============================================================
+  # 发布任务：创建 GitHub Release
+  # ============================================================
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    if: ${{ always() && contains(needs.build.result, 'success') }}
+    
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: 整理发布文件
+        run: |
+          mkdir -p release
+          find artifacts -type f -name 'frankenphp-linux-*' -exec cp {} release/ \;
+          echo "=== 发布文件 ==="
+          ls -lh release/
+      
+      - name: 生成 Release 标签
+        id: release_tag
+        run: |
+          if [ -z "${{ inputs.release_tag }}" ]; then
+            TAG="v$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+          else
+            TAG="${{ inputs.release_tag }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+      
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: FrankenPHP ${{ steps.release_tag.outputs.tag }}
+          body: |
+            ## 构建信息
+            
+            - **PHP 版本**: ${{ inputs.php_version }}
+            - **PHP 扩展**: ${{ inputs.php_extensions }}
+            - **扩展依赖库**: ${{ inputs.php_extension_libs }}
+            - **Caddy 模块**: ${{ inputs.caddy_modules }}
+            - **构建架构**: ${{ inputs.architectures }}
+            
+            ## 使用方法
+            
+            ```bash
+            # 启动 HTTP 服务
+            ./frankenphp-linux-x86_64 php-server --root public/
+            
+            # 查看 PHP 扩展
+            ./frankenphp-linux-x86_64 php-cli -m
+            
+            # 查看 Caddy 模块
+            ./frankenphp-linux-x86_64 list-modules
+            ```
+          files: |
+            release/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
