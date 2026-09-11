@@ -53,13 +53,29 @@ jobs:
       # openssl            : AES-256-GCM 加密
       # fileinfo           : MIME 类型识别
       # dom+iconv          : 解析网站 HTML 找 favicon
+      # exif               : 读照片的拍摄参数（相机/光圈/快门/ISO）
+      #
+      # 注意：不需要 session —— 会话是我们自己用 Cookie + 数据库实现的
       PHP_EXTENSIONS: >-
-        opcache,pdo_sqlite,sqlite3,curl,mbstring,gd,zip,openssl,fileinfo,dom,iconv
+        opcache,pdo_sqlite,sqlite3,curl,mbstring,gd,zip,openssl,fileinfo,dom,iconv,exif
+
+      # ── gd 的可选依赖库 ───────────────────────────────────────
+      # static-php-cli 默认遵循"最小依赖原则"，不写这些的话：
+      #   libjpeg   → 处理不了 JPEG
+      #   libwebp   → 处理不了 WebP
+      #   freetype  → 不能在图片上画文字（生成印章图标要用）
+      PHP_EXTENSION_LIBS: >-
+        libjpeg,libwebp,freetype
 
       # ── Caddy 额外模块 ────────────────────────────────────────
-      # forwardproxy 用 klzgrad 的分支（带 naiveproxy 的流量padding）
-      # caddy-dns/cloudflare 用于 DNS-01 申请通配符证书
+      # ★ caddy-cbrotli 必须显式写进来！
+      #   FrankenPHP 默认自带它，但一旦我们自定义了 XCADDY_ARGS，
+      #   默认值就被整个覆盖掉了 —— 少了它 php-server 会报
+      #   "module not registered: http.encoders.br"
+      # forwardproxy 用 klzgrad 的分支（带 naiveproxy 的流量 padding）
+      # caddy-dns/cloudflare 用于 DNS-01 申请证书
       XCADDY_ARGS: >-
+        --with github.com/dunglas/caddy-cbrotli
         --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive
         --with github.com/caddy-dns/cloudflare
 
@@ -79,6 +95,7 @@ jobs:
           docker buildx bake --load \
             --set static-builder-gnu.platform=linux/amd64 \
             --set static-builder-gnu.args.PHP_EXTENSIONS="${PHP_EXTENSIONS}" \
+            --set static-builder-gnu.args.PHP_EXTENSION_LIBS="${PHP_EXTENSION_LIBS}" \
             --set static-builder-gnu.args.XCADDY_ARGS="${XCADDY_ARGS}" \
             --set static-builder-gnu.args.PHP_VERSION="${{ inputs.php_version || '8.3' }}" \
             static-builder-gnu
@@ -92,15 +109,31 @@ jobs:
           chmod +x frankenphp-linux-x86_64
           ls -lh frankenphp-linux-x86_64
 
-      - name: 自检 —— 二进制能不能跑
+      - name: 自检 —— 二进制能不能跑，扩展齐不齐
+        # 注意：不能用 `php-cli -m`，FrankenPHP 的这个参数要求 PHP >= 8.6
+        # 所以改成写一个 .php 文件让 php-cli 去跑
         run: |
           set -euxo pipefail
           ./frankenphp-linux-x86_64 version
-          echo '<?php echo "PHP ", PHP_VERSION, "\n";' > /tmp/t.php
-          ./frankenphp-linux-x86_64 php-cli /tmp/t.php
-          ./frankenphp-linux-x86_64 php-cli -m | sort
+
+          echo '<?php $need=["pdo_sqlite","sqlite3","curl","mbstring","gd","zip","openssl","fileinfo","dom","json","session"]; $have=array_map("strtolower",get_loaded_extensions()); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "已装扩展 ",count($have)," 个\n"; if($miss){echo "缺少：",implode(", ",$miss),"\n"; exit(1);} echo "需要的扩展全都在\n";' > /tmp/check.php
+
+          ./frankenphp-linux-x86_64 php-cli /tmp/check.php
+
+      - name: 自检 —— Caddy 模块齐不齐
+        # 这一条是为了防止重犯同一个错：自定义 XCADDY_ARGS 时会覆盖掉默认模块。
+        # 少了 brotli，php-server 直接起不来（报 module not registered）。
+        run: |
+          set -euxo pipefail
+          MODS=$(./frankenphp-linux-x86_64 list-modules)
+          echo "$MODS" | grep -q '^http.encoders.br$'            || { echo "✗ 缺少 Brotli 编码器 http.encoders.br"; exit 1; }
+          echo "$MODS" | grep -q '^http.handlers.forward_proxy$' || { echo "✗ 缺少 naiveproxy http.handlers.forward_proxy"; exit 1; }
+          echo "$MODS" | grep -q '^dns.providers.cloudflare$'    || { echo "✗ 缺少 dns.providers.cloudflare"; exit 1; }
+          echo "✓ Caddy 模块齐全（brotli + naiveproxy + cloudflare DNS）"
 
       - name: 打包上传为 Release 附件
+        # if: always() —— 自检即使失败，也别丢掉跑了 18 分钟的构建产物
+        if: always()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
@@ -111,7 +144,7 @@ jobs:
             下载 `frankenphp-linux-x86_64` 后：
             ```bash
             chmod +x frankenphp-linux-x86_64
-            ./frankenphp-linux-x86_64 php-server -r public   # 本地开发
+            ./frankenphp-linux-x86_64 php-server -r public   # 启动网站
             ./frankenphp-linux-x86_64 php-cli app/seed.php   # 建库
             ```
           files: frankenphp-linux-x86_64
