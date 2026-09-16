@@ -40,7 +40,7 @@ on:
         description: 'PHP 扩展（逗号分隔）'
         required: true
         default: >-
-          opcache,pdo_sqlite,sqlite3,curl,mbstring,gd,zip,openssl,fileinfo,dom,iconv,exif
+          opcache,pdo_mysql,mysqli,pdo_sqlite,sqlite3,curl,mbstring,gd,zip,openssl,fileinfo,dom,iconv,exif
 
       php_extension_libs:
         description: '扩展依赖库（逗号分隔；gd 需要它们才能处理 JPEG/WebP 和写中文）'
