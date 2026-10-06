@@ -56,7 +56,30 @@
 #     mbregex，导致 mb_ereg* 系列全部未定义。自检 A 只看扩展名，
 #     查不出这类问题，所以这里改成直接对函数做 function_exists 检测。
 #
-#  3) Release 说明里的内存参考数据更新，并补上 Typecho 部署要点。
+#  3) 新增「修补 CentOS 7 yum 源」步骤 —— 上一版构建在第一步就挂了：
+#
+#       failure: repodata/...-primary.sqlite.bz2 from base:
+#       [Errno 256] No more mirrors to try.
+#       http://vault.centos.org/centos/7/os/x86_64/repodata/...:
+#       [Errno 14] HTTPS Error 403 - Forbidden
+#
+#     static-builder-gnu.Dockerfile 基于 FROM centos:7，而 CentOS 7 已于
+#     2024-06-30 EOL；上游把源指向 vault.centos.org，该域名走 AWS
+#     CloudFront，会对 GitHub runner 所在 IP 段返回 403（实测同一 URL
+#     从俄罗斯 VPS 访问是 200，从 runner 访问是 403）。
+#     GTS 处理方式是在构建前重写 Dockerfile 里那段 repo 逻辑，
+#     把源换到 mirrors.aliyun.com。详见该步骤内的注释。
+#
+#  4) 新增「释放磁盘空间」步骤 —— PHP 从源码编译 + CentOS 7 基础镜像
+#     很吃磁盘，而 GitHub 标准 runner 只有约 14 GB 可用。
+#
+#  5) 新增「自检 A2 —— 关键函数可用性」，并修正两个实测踩到的写法问题：
+#     · FrankenPHP 的 php-cli 不支持不带括号的 exit（`exit $fail;`
+#       会报 Parse error），改用 echo 标记 + shell 侧 grep 判定；
+#     · 该静态构建不提供 sqlite3_open() 这个程式化函数，判断 SQLite
+#       可用性要按 Typecho 适配器的方式（extension_loaded + PDO 驱动）。
+#
+#  6) Release 说明里的内存参考数据更新，并补上 Typecho 部署要点。
 #
 #  ── 参考数据（本次核实）────────────────────────────────────────────
 #   Typecho 1.3.0 官方要求：
@@ -204,6 +227,134 @@ jobs:
 
       - name: 拉取 FrankenPHP 官方仓库
         run: git clone --depth 1 https://github.com/php/frankenphp.git
+
+      # ────────────────────────────────────────────────────────────────
+      #  ★★★ 修补 CentOS 7 的 yum 源（必需，否则构建从一开始就失败）★★★
+      #
+      #  问题：
+      #    static-builder-gnu.Dockerfile 是 FROM centos:7，而 CentOS 7 已于
+      #    2024-06-30 EOL。上游把源指向了 vault.centos.org，但该域名由
+      #    AWS CloudFront 提供服务（143.204.238.x），会对部分 IP 段返回
+      #    403 Forbidden —— GitHub 的 runner 正好落在这个范围里：
+      #
+      #      failure: repodata/...-primary.sqlite.bz2 from base:
+      #      [Errno 256] No more mirrors to try.
+      #      http://vault.centos.org/centos/7/os/x86_64/repodata/...:
+      #      [Errno 14] HTTPS Error 403 - Forbidden
+      #
+      #    实测对比（同一时刻，同一 URL）：
+      #      从俄罗斯 VPS 访问 vault.centos.org   → HTTP 200
+      #      从 GitHub runner 访问                 → HTTP 403
+      #    即 CDN 层面的地域/IP 封锁，不是仓库真的挂了。
+      #
+      #  解决：
+      #    在构建前重写 Dockerfile 里那段 repo 处理逻辑，把 CentOS 源
+      #    换到公共镜像站 mirrors.aliyun.com。
+      #
+      #  ⚠️ 这里有个容易踩的坑（我第一版就踩了）：
+      #    不能简单地做 s/vault.centos.org/<aliyun>/g，因为原始 URL 形如
+      #        mirror.centos.org/centos/$releasever/os/$basearch/
+      #    只换域名会得到
+      #        .../centos-vault/7.9.2009/centos/$releasever/os/...
+      #    多出一层 /centos/$releasever，实测 404。
+      #    必须把「域名 + /centos/$releasever」整体替换掉。
+      #
+      #  已验证的映射：
+      #    mirror.centos.org/centos/$releasever → mirrors.aliyun.com/centos-vault/7.9.2009
+      #    mirror.centos.org/centos/7           → mirrors.aliyun.com/centos-vault/7.9.2009
+      #    vault.centos.org/centos/$releasever  → mirrors.aliyun.com/centos-vault/7.9.2009
+      #    vault.centos.org/altarch/7           → mirrors.aliyun.com/centos-vault/altarch/7.9.2009
+      #
+      #  实测替换后的地址全部可用（x86_64）：
+      #    /centos-vault/7.9.2009/os/x86_64/           200
+      #    /centos-vault/7.9.2009/updates/x86_64/      200
+      #    /centos-vault/7.9.2009/extras/x86_64/       200
+      #    /centos-vault/7.9.2009/centosplus/x86_64/   200
+      #    /centos-vault/7.9.2009/sclo/x86_64/rh/      200
+      #    /centos-vault/altarch/7.9.2009/os/aarch64/  200
+      #  且已确认 centos-release-scl 包在 extras 里、
+      #  devtoolset-10 在 sclo/x86_64/rh 里（1316 个匹配）。
+      # ────────────────────────────────────────────────────────────────
+      - name: 修补 CentOS 7 yum 源（规避 vault.centos.org 的 403）
+        working-directory: frankenphp
+        run: |
+          set -euxo pipefail
+
+          DF=static-builder-gnu.Dockerfile
+          test -f "$DF"
+
+          echo "=== 替换前 ==="
+          grep -n 'centos\.org' "$DF" || true
+
+          # 用 Python 做精确替换：只改 Dockerfile 里那两个 sed 的
+          # 「搜索模式 + 替换参数」，不动其它任何内容。
+          python3 - "$DF" <<'PYEOF'
+          import io, re, sys
+
+          path = sys.argv[1]
+          src = io.open(path, encoding='utf-8').read()
+
+          # 统一的替换片段：把 CentOS 源指向 aliyun，且把版本号写死，
+          # 避免残留 /centos/$releasever 造成 404。
+          NEW_BASE = ("s#mirror.centos.org/centos/$releasever#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
+                      "s#mirror.centos.org/centos/7#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
+                      "s#mirror.centos.org#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
+                      "s#vault.centos.org/centos/$releasever#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
+                      "s#vault.centos.org#mirrors.aliyun.com/centos-vault/7.9.2009#g")
+
+          NEW_ALT = ("s|mirror.centos.org/centos|mirrors.aliyun.com/centos-vault/altarch/7.9.2009|g; "
+                     "s|vault.centos.org/altarch|mirrors.aliyun.com/centos-vault/altarch/7.9.2009|g")
+
+          # 1) 通用 base 替换（第 46 行与第 61 行是同一条语句）
+          pat_base = re.compile(
+              r"s/mirror\.centos\.org/vault\.centos\.org/g")
+          src, n1 = pat_base.subn(NEW_BASE, src)
+
+          # 2) altarch 替换（第 56、57 行）
+          pat_alt = re.compile(
+              r"s\|mirror\.centos\.org/centos\|vault\.centos\.org/altarch\|g")
+          src, n2 = pat_alt.subn(NEW_ALT, src)
+
+          io.open(path, 'w', encoding='utf-8').write(src)
+          print("  已替换 base 模式 %d 处，altarch 模式 %d 处" % (n1, n2))
+          PYEOF
+
+          echo "=== 替换后 ==="
+          grep -n 'aliyun' "$DF" || true
+
+          # 校验说明：
+          #   替换之后，Dockerfile 里的 sed 表达式中【搜索模式】仍然写作
+          #   mirror.centos.org —— 这是必须保留的（它要匹配的是基础镜像里
+          #   的 repo 文件内容）。所以不能简单地 grep centos.org 就报错，
+          #   否则永远误判。真正要确认的是：
+          #     没有「直接作为 URL 使用」的 centos.org 引用
+          # 即：排除掉 sed 脚本行之后，不应再有 centos.org。
+          echo "=== 校验：非 sed 行中不应再有 centos.org 引用 ==="
+          LEFTOVER=$(grep -n 'centos\.org' "$DF" | grep -v 'sed -i' || true)
+          if [ -n "$LEFTOVER" ]; then
+            echo "❌ 发现非 sed 的 centos.org 引用（这些会真的被访问到）："
+            echo "$LEFTOVER"
+            exit 1
+          fi
+          echo "✅ 无直接引用的 centos.org（sed 搜索模式保留，符合预期）"
+
+          echo "=== 已改写的 sed 替换参数 ==="
+          grep -n 'sed -i' "$DF" | grep 'aliyun' | sed 's/^/  /'
+
+          echo "=== 预检：替换后推导出的 repo 地址是否可用 ==="
+          for u in \
+            "https://mirrors.aliyun.com/centos-vault/7.9.2009/os/x86_64/repodata/repomd.xml" \
+            "https://mirrors.aliyun.com/centos-vault/7.9.2009/updates/x86_64/repodata/repomd.xml" \
+            "https://mirrors.aliyun.com/centos-vault/7.9.2009/extras/x86_64/repodata/repomd.xml" \
+            "https://mirrors.aliyun.com/centos-vault/7.9.2009/sclo/x86_64/rh/repodata/repomd.xml" ; do
+            code=$(curl -sI --max-time 20 -o /dev/null -w '%{http_code}' "$u" || echo ERR)
+            echo "  $code  $(echo "$u" | sed 's|https://mirrors.aliyun.com||')"
+            if [ "$code" != "200" ]; then
+              echo "❌ 源不可用，构建会失败"
+              exit 1
+            fi
+          done
+          echo "✅ 源可用性预检通过"
 
       - name: 配置 Buildx
         uses: docker/setup-buildx-action@v3
