@@ -78,21 +78,34 @@
 #       http://mirrors.aliyun.com/centos-vault/7.9.2009/altarch/7/
 #            os/aarch64/repodata/repomd.xml: 404
 #
-#     aarch64 的仓库不在 /centos-vault/7.9.2009/ 下，而在
-#     /centos-vault/altarch/7.9.2009/ 下。且 aarch64 上：
-#       · CentOS-SCLo-*.repo 写 /centos/altarch/7/（硬编码 7）
-#       · CentOS-Base.repo   写 /centos/altarch/$releasever/
-#     原 Dockerfile 只在 aarch64 分支里改了 SCLo 两个文件，
-#     没管 CentOS-Base.repo，所以 yum 一开始就 404。
-#     修法：在替换规则最前面加两条 altarch 精确规则（幂等，
-#     x86_64 的 .repo 里不出现 altarch，所以对 amd64 零影响）。
-#     同时给预检加了 aarch64 地址检查，避免再白等十几分钟。
+#     真实原因（把 centos:7 的 centos-release RPM 解包看出来的，不是猜的）：
 #
-#     实测（替换后生成的 baseurl 全部 200）：
-#       aarch64: /centos-vault/altarch/7.9.2009/{os,updates,extras}/aarch64/
-#                /centos-vault/altarch/7.9.2009/sclo/aarch64/rh/
-#       x86_64 : /centos-vault/7.9.2009/{os,extras}/x86_64/
-#                /centos-vault/7.9.2009/sclo/x86_64/rh/
+#       aarch64 的 CentOS-Base.repo 里写的是
+#           http://mirror.centos.org/altarch/$releasever/os/$basearch/
+#                                     ^^^^^^^^^ 没有 /centos/ 这一段！
+#       而 x86_64 写的是
+#           http://mirror.centos.org/centos/$releasever/os/$basearch/
+#
+#     所以只按 /centos/altarch/... 写的规则一条都不命中，最后只有兜底
+#     规则 s#mirror.centos.org#...7.9.2009# 生效，得到：
+#           mirrors.aliyun.com/centos-vault/7.9.2009/altarch/$releasever/os/...
+#                                                      ↑ 版本号还是变量
+#     yum 把 $releasever 解析成 7 → /centos-vault/7.9.2009/altarch/7/... → 404
+#
+#     修法：在 yum 之前加一条用 ^baseurl=http 锚定的 sed，把
+#     「错误的 aliyun 路径」整体替换成
+#           mirrors.aliyun.com/centos-vault/altarch/7.9.2009
+#     规则只匹配含 altarch/ 的 URL，x86_64 上不会命中。
+#
+#     已用真实 repo 文件（从 RPM 解包得到）验证：
+#       aarch64: base / updates / extras 三个生效仓库全部 200
+#       x86_64 : 回归通过，未被污染
+#     预检也加了 aarch64 地址检查，避免再白等十几分钟。
+#
+#     ⚠️ 另一个坑：插入的说明文字必须用 echo，不能用 # 注释。
+#        Dockerfile 的 \ 续行会把整个 RUN 拼成一条命令交给 shell，
+#        shell 会先把 # 开头的行删掉，于是上一层的 && 后面直接换行，
+#        导致语法错误。（本次已踩过，脚本里有自动检查。）
 #
 #  6) 修补 Dockerfile 里 make 的下载源。第二次构建时 CentOS 源已经
 #     修好（yum 顺利装完 centos-release-scl 与 devtoolset-10），但
@@ -535,6 +548,64 @@ jobs:
 
           echo "=== 确认修改结果 ==="
           grep -n 'dl_make\|dl.sh\|--retry' "$DF" | sed 's/^/  /'
+
+          # ────────────────────────────────────────────────────────────
+          #  ★★★ 最后一道修复：把 altarch 里的 $releasever 消掉 ★★★
+          #
+          #  这一步是踩了三次坑才定位到的。真实情况（把 centos:7 的
+          #  centos-release RPM 解包看出来的，不是猜的）：
+          #
+          #  aarch64 的 /etc/yum.repos.d/CentOS-Base.repo 里写的是：
+          #      #baseurl=http://mirror.centos.org/altarch/$releasever/os/$basearch/
+          #                               ^^^^^^^^^ 这里【没有】 /centos/ 这一段！
+          #
+          #  也就是说 aarch64 用 mirror.centos.org/altarch/...，
+          #  而 x86_64 用 mirror.centos.org/centos/...。
+          #  前面几条规则全按 /centos/altarch/... 写，所以一条都没命中，
+          #  只有兜底规则 s#mirror.centos.org#...# 命中，结果变成：
+          #
+          #      mirrors.aliyun.com/centos-vault/7.9.2009/altarch/$releasever/os/...
+          #                                                 ↑ 版本号还是变量
+          #
+          #  yum 把 $releasever 解析成 7，于是请求：
+          #      /centos-vault/7.9.2009/altarch/7/os/aarch64/  → 404
+          #
+          #  修法：在 yum 之前把「错误的 aliyun 路径」整体替换成正确路径。
+          #  用 ^baseurl=http 锚定，避免误伤注释里的示例。
+          #  规则只匹配含 altarch/ 的 URL，x86_64 上不会命中。
+          #
+          #  已用真实 repo 文件验证：改完 aarch64 的 base/updates/extras
+          #  三个生效仓库全部 200，x86_64 不受影响。
+          # ────────────────────────────────────────────────────────────
+          echo "=== 插入 altarch 路径修正 ==="
+          python3 - "$DF" <<'PYEOF'
+          import io, sys
+          p = sys.argv[1]
+          s = io.open(p, encoding='utf-8').read()
+          old = "yum clean all && \\"
+          if old not in s:
+              print("  ⚠️ 未找到 yum clean all 行，跳过"); sys.exit(0)
+          # 注意：这里的注释必须用 echo 而不是 #。
+          # Dockerfile 的 \ 续行会把整个 RUN 拼成一条命令再交给 shell，
+          # 而 shell 会先把 # 开头的内容当注释【删掉】，于是上一层
+          # 命令末尾的 && 后面直接跟换行/下一条命令，导致语法错误。
+          # 用 echo ... && \ 就能既留说明又不破坏链条。
+          ins = ("\techo '>>> 修正 altarch 路径：aarch64 的 repo 用的是' && \\\n"
+                 "\techo '>>> mirror.centos.org/altarch/... 而不是 /centos/altarch/...' && \\\n"
+                 "\tsed -i 's#^baseurl=http://mirrors\\.aliyun\\.com/centos-vault/7\\.9\\.2009/altarch/\\$releasever#"
+                 "baseurl=http://mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g; "
+                 "s#^baseurl=http://mirror\\.centos\\.org/altarch/\\$releasever#"
+                 "baseurl=http://mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g; "
+                 "s#^baseurl=http://vault\\.centos\\.org/altarch/\\$releasever#"
+                 "baseurl=http://mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g' "
+                 "/etc/yum.repos.d/*.repo && \\\n" + old)
+          s = s.replace(old, ins, 1)
+          io.open(p, 'w', encoding='utf-8').write(s)
+          print("  ✅ 已插入 altarch 修正规则（注释改用 echo，不破坏 && 链）")
+          PYEOF
+
+          echo "=== yum 前的最终命令序列 ==="
+          sed -n '/修正 altarch 路径/,/yum install -y centos-release-scl/p' "$DF" | sed 's/^/  /'
 
       - name: 配置 Buildx
         uses: docker/setup-buildx-action@v3
