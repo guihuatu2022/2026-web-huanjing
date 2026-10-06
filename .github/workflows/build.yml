@@ -73,7 +73,28 @@
 #  4) 新增「释放磁盘空间」步骤 —— PHP 从源码编译 + CentOS 7 基础镜像
 #     很吃磁盘，而 GitHub 标准 runner 只有约 14 GB 可用。
 #
-#  5) 修补 Dockerfile 里 make 的下载源。第二次构建时 CentOS 源已经
+#  5) ★ 修补 aarch64（altarch）的仓库路径 —— arm64 构建挂在 yum 第一步：
+#
+#       http://mirrors.aliyun.com/centos-vault/7.9.2009/altarch/7/
+#            os/aarch64/repodata/repomd.xml: 404
+#
+#     aarch64 的仓库不在 /centos-vault/7.9.2009/ 下，而在
+#     /centos-vault/altarch/7.9.2009/ 下。且 aarch64 上：
+#       · CentOS-SCLo-*.repo 写 /centos/altarch/7/（硬编码 7）
+#       · CentOS-Base.repo   写 /centos/altarch/$releasever/
+#     原 Dockerfile 只在 aarch64 分支里改了 SCLo 两个文件，
+#     没管 CentOS-Base.repo，所以 yum 一开始就 404。
+#     修法：在替换规则最前面加两条 altarch 精确规则（幂等，
+#     x86_64 的 .repo 里不出现 altarch，所以对 amd64 零影响）。
+#     同时给预检加了 aarch64 地址检查，避免再白等十几分钟。
+#
+#     实测（替换后生成的 baseurl 全部 200）：
+#       aarch64: /centos-vault/altarch/7.9.2009/{os,updates,extras}/aarch64/
+#                /centos-vault/altarch/7.9.2009/sclo/aarch64/rh/
+#       x86_64 : /centos-vault/7.9.2009/{os,extras}/x86_64/
+#                /centos-vault/7.9.2009/sclo/x86_64/rh/
+#
+#  6) 修补 Dockerfile 里 make 的下载源。第二次构建时 CentOS 源已经
 #     修好（yum 顺利装完 centos-release-scl 与 devtoolset-10），但
 #     倒在了下一个 RUN：
 #
@@ -314,14 +335,44 @@ jobs:
 
           # 统一的替换片段：把 CentOS 源指向 aliyun，且把版本号写死，
           # 避免残留 /centos/$releasever 造成 404。
-          NEW_BASE = ("s#mirror.centos.org/centos/$releasever#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
-                      "s#mirror.centos.org/centos/7#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
-                      "s#mirror.centos.org#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
-                      "s#vault.centos.org/centos/$releasever#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
-                      "s#vault.centos.org#mirrors.aliyun.com/centos-vault/7.9.2009#g")
+          #
+          # ⚠️ aarch64（altarch）是另一个坑，日志里报的正是这个：
+          #
+          #   http://mirrors.aliyun.com/centos-vault/7.9.2009/altarch/7/os/aarch64/
+          #                                    repodata/repomd.xml: 404
+          #
+          #   aarch64 的仓库不在 /centos-vault/7.9.2009/ 下面，而是在
+          #   /centos-vault/altarch/7.9.2009/ 下面。而且 aarch64 上：
+          #     · CentOS-SCLo-*.repo 里写的是 .../centos/altarch/7/...
+          #       （硬编码的 7，需要改写成 altarch/7.9.2009）
+          #     · CentOS-Base.repo  里写的是 .../centos/altarch/$releasever/...
+          #       （$releasever，需要换成 7.9.2009 但【保留】 altarch）
+          #   原 Dockerfile 只在 aarch64 分支里改了 SCLo 两个文件，
+          #   没管 CentOS-Base.repo，所以 yum 一开始就 404。
+          #
+          #   解决办法：把这两条 altarch 规则排在最前面。
+          #   它们是幂等的：x86_64 的 .repo 里根本不出现 altarch，
+          #   这两条规则不会命中，所以对 amd64 完全没有影响。
+          NEW_BASE = (
+              # ① SCLo（aarch64）：/centos/altarch/7 → altarch/7.9.2009
+              "s#mirror.centos.org/centos/altarch/7#mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g; "
+              # ② SCLo（x86_64）：/centos/7 → centos-vault/7.9.2009
+              "s#mirror.centos.org/centos/7#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
+              # ③ 基础仓库（aarch64）：/centos/altarch/$releasever → altarch/7.9.2009
+              "s#mirror.centos.org/centos/altarch/$releasever#mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g; "
+              # ④ 基础仓库（x86_64）：/centos/$releasever → centos-vault/7.9.2009
+              "s#mirror.centos.org/centos/$releasever#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
+              # ⑤ 兜底
+              "s#mirror.centos.org#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
+              # ⑥ 若上游已经换成 vault.centos.org
+              "s#vault.centos.org/centos/$releasever#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
+              "s#vault.centos.org#mirrors.aliyun.com/centos-vault/7.9.2009#g")
 
-          NEW_ALT = ("s|mirror.centos.org/centos|mirrors.aliyun.com/centos-vault/altarch/7.9.2009|g; "
-                     "s|vault.centos.org/altarch|mirrors.aliyun.com/centos-vault/altarch/7.9.2009|g")
+          # altarch 分支（第 56、57 行）的替换：这两行本来就只作用于
+          # aarch64，所以直接补上版本号即可。
+          NEW_ALT = ("s|mirror.centos.org/centos/altarch/7|mirrors.aliyun.com/centos-vault/altarch/7.9.2009|g; "
+                     "s|mirror.centos.org/centos/7|mirrors.aliyun.com/centos-vault/7.9.2009|g; "
+                     "s|vault.centos.org/altarch/7|mirrors.aliyun.com/centos-vault/altarch/7.9.2009|g")
 
           # 1) 通用 base 替换（第 46 行与第 61 行是同一条语句）
           pat_base = re.compile(
@@ -372,7 +423,26 @@ jobs:
               exit 1
             fi
           done
-          echo "✅ 源可用性预检通过"
+
+          # ★ 同时预检 aarch64（altarch）的地址。
+          #   这一条是补上来的：上次 arm64 构建就是因为 altarch 路径
+          #   拼错（少了 altarch 段 / 版本号没消掉）而在 yum 第一步
+          #   就 404，白等了十几分钟。在 runner 上直接 curl 一下
+          #   aarch64 的 repomd.xml 就能提前发现，不用等 docker 构建。
+          echo "=== 预检 aarch64（altarch）地址 ==="
+          for u in \
+            "https://mirrors.aliyun.com/centos-vault/altarch/7.9.2009/os/aarch64/repodata/repomd.xml" \
+            "https://mirrors.aliyun.com/centos-vault/altarch/7.9.2009/updates/aarch64/repodata/repomd.xml" \
+            "https://mirrors.aliyun.com/centos-vault/altarch/7.9.2009/extras/aarch64/repodata/repomd.xml" \
+            "https://mirrors.aliyun.com/centos-vault/altarch/7.9.2009/sclo/aarch64/rh/repodata/repomd.xml" ; do
+            code=$(curl -sI --max-time 20 -o /dev/null -w '%{http_code}' "$u" || echo ERR)
+            echo "  $code  $(echo "$u" | sed 's|https://mirrors.aliyun.com||')"
+            if [ "$code" != "200" ]; then
+              echo "❌ aarch64 源不可用，arm64 构建会失败"
+              exit 1
+            fi
+          done
+          echo "✅ x86_64 与 aarch64 源可用性预检全部通过"
 
           # ────────────────────────────────────────────────────────────
           #  顺带修掉 Dockerfile 里几处脆弱的下载（同一批次，避免多跑一轮）
