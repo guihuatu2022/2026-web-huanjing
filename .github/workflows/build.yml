@@ -73,13 +73,31 @@
 #  4) 新增「释放磁盘空间」步骤 —— PHP 从源码编译 + CentOS 7 基础镜像
 #     很吃磁盘，而 GitHub 标准 runner 只有约 14 GB 可用。
 #
-#  5) 新增「自检 A2 —— 关键函数可用性」，并修正两个实测踩到的写法问题：
+#  5) 修补 Dockerfile 里 make 的下载源。第二次构建时 CentOS 源已经
+#     修好（yum 顺利装完 centos-release-scl 与 devtoolset-10），但
+#     倒在了下一个 RUN：
+#
+#       #13 182.3 curl: (7) Failed to connect to 2001:470:142:3::b:
+#                    Network is unreachable
+#       #13 182.7 curl: (22) The requested URL returned error: 404
+#
+#     2001:470:142:3::b 是 ftp.gnu.org 的 IPv6 地址。ftp.gnu.org 的 DNS
+#     同时返回 IPv4 与 IPv6，而 GitHub runner 没有 IPv6 出口，curl 会
+#     先试 IPv6 并卡住很久（实测 182 秒）才失败；而 make 的下载是那条
+#     长 && 链的第一环，一失败整条链就断。
+#     改法：换成「强制 IPv4 + 多镜像依次重试」的自包含写法
+#     （aliyun → kernel.org → 清华 → 原站），并显式 test -s 校验产物。
+#     实测 mirrors.aliyun.com 可正常取到 make-4.4.tar.gz
+#     （2307891 字节，414 个文件，configure 脚本完好）。
+#     同时给其余 4 处 curl 补上 --connect-timeout / --retry。
+#
+#  6) 新增「自检 A2 —— 关键函数可用性」，并修正两个实测踩到的写法问题：
 #     · FrankenPHP 的 php-cli 不支持不带括号的 exit（`exit $fail;`
 #       会报 Parse error），改用 echo 标记 + shell 侧 grep 判定；
 #     · 该静态构建不提供 sqlite3_open() 这个程式化函数，判断 SQLite
 #       可用性要按 Typecho 适配器的方式（extension_loaded + PDO 驱动）。
 #
-#  6) Release 说明里的内存参考数据更新，并补上 Typecho 部署要点。
+#  7) Release 说明里的内存参考数据更新，并补上 Typecho 部署要点。
 #
 #  ── 参考数据（本次核实）────────────────────────────────────────────
 #   Typecho 1.3.0 官方要求：
@@ -355,6 +373,98 @@ jobs:
             fi
           done
           echo "✅ 源可用性预检通过"
+
+          # ────────────────────────────────────────────────────────────
+          #  顺带修掉 Dockerfile 里几处脆弱的下载（同一批次，避免多跑一轮）
+          #
+          #  a) make 的下载源是 https://ftp.gnu.org/gnu/make/make-4.4.tar.gz
+          #     实测该主机在部分网络 TCP 443 完全不可达（DNS 能解析到
+          #     209.51.188.20，但连不上）。而它是那条长 && 链的第一环，
+          #     一旦失败整条链就断。
+          #     改成多镜像回退：kernel.org → aliyun → 清华 → 原站。
+          #     实测 mirrors.kernel.org 可正常取到 make-4.4.tar.gz
+          #     （2307891 字节，414 个文件）。
+          #
+          #  b) 其余几处 curl 补上 --connect-timeout / --retry，
+          #     避免 PHP 从源码编译这种长构建因网络抖动整体失败。
+          #     只加参数、不动原有结构与引号，避免破坏 go.dev 那条
+          #     含嵌套命令替换与转义引号的复杂语句。
+          # ────────────────────────────────────────────────────────────
+          echo "=== 修补 Dockerfile 里的下载（make 多镜像 + 全部加重试）==="
+
+          python3 - "$DF" <<'PYEOF'
+          import io, sys
+          p = sys.argv[1]
+          s = io.open(p, encoding='utf-8').read()
+
+          # ── 修掉 make 的下载 ──
+          #
+          #  原始：curl -o make.tar.gz -fsSL https://ftp.gnu.org/gnu/make/make-4.4.tar.gz
+          #
+          #  实测这个问题有两层：
+          #   1) ftp.gnu.org 的 DNS 同时返回 IPv4 与 IPv6。GitHub runner
+          #      没有 IPv6 出口，curl 会先试 IPv6 然后卡很久才失败：
+          #        curl: (7) Failed to connect to 2001:470:142:3::b:
+          #        Network is unreachable
+          #      实测在该 runner 上卡了 182 秒。
+          #   2) 它是那条长 && 链的第一环，一旦失败整条链就断。
+          #
+          #  修法：换成「-4 强制 IPv4 + 多个镜像依次重试」的自包含写法，
+          #  不引入额外文件、不引入续行符。
+          #
+          #  ⚠️ 踩过的坑（都实测过）：
+          #   · 不要用 Dockerfile 里的 printf 多行写法生成辅助脚本 ——
+          #     YAML 块标量 dedent 后续行符会变成「反斜杠+空格」，续行失效，
+          #     执行时报一堆 command not found，脚本根本生成不出来。
+          #   · 即使用 printf 的 %b 正确生成了脚本，把脚本内容塞进
+          #     YAML 里也极易因缩进错位而破坏外层引号
+          #     （实测报 syntax error near unexpected token `('）。
+          #   所以最稳的做法就是这一行原地替换，不新增任何 shell 文件。
+          MT = ('V=$(curl --version|head -1); case "$V" in *" 7.29."*) IPV=;; '
+                '*) IPV=-4;; esac; '
+                'for U in '
+                'https://mirrors.aliyun.com/gnu/make/make-4.4.tar.gz '
+                'https://mirrors.kernel.org/gnu/make/make-4.4.tar.gz '
+                'https://mirrors.tuna.tsinghua.edu.cn/gnu/make/make-4.4.tar.gz '
+                'https://ftp.gnu.org/gnu/make/make-4.4.tar.gz '
+                '; do '
+                'curl -o make.tar.gz -fsSL $IPV --connect-timeout 30 '
+                '--retry 3 --retry-delay 3 --max-time 900 "$U" && break ; '
+                'done ; '
+                # 循环之后必须显式校验产物。原因：for/done 本身的退出码
+                # 取决于最后一条命令，全部镜像都失败时也可能返回 0，
+                # 那样 && 链会继续往下走，最后在 tar 那里报一个更难
+                # 看懂的错。用 test -s 把失败挡在这里。
+                'test -s make.tar.gz')
+
+          old_make = "curl -o make.tar.gz -fsSL https://ftp.gnu.org/gnu/make/make-4.4.tar.gz"
+          if old_make in s:
+              s = s.replace(old_make, MT, 1)
+              print("  ✅ make 下载已改为「强制 IPv4 + 多镜像重试」")
+          else:
+              print("  ⚠️ 未找到 make 下载行（上游可能已改），跳过")
+
+          # ── 其余 curl 加超时与重试（只加参数，不动结构）──
+          RETRY = "--connect-timeout 30 --retry 3 --retry-delay 3 "
+          reps = [
+              ("curl -o cmake.tar.gz -fsSL ", "curl -o cmake.tar.gz -fsSL " + RETRY),
+              ("curl -fsSL -o patchelf.tar.gz ", "curl -fsSL " + RETRY + "-o patchelf.tar.gz "),
+              ("curl -o /usr/local/bin/jq -fsSL ", "curl -o /usr/local/bin/jq -fsSL " + RETRY),
+              ("curl -o go.tar.gz -fsSL ", "curl -o go.tar.gz -fsSL " + RETRY),
+              ("curl -fsS https://go.dev/dl/?mode=json",
+               "curl -fsS " + RETRY + "https://go.dev/dl/?mode=json"),
+          ]
+          n = 0
+          for a, b in reps:
+              if a in s:
+                  s = s.replace(a, b, 1); n += 1
+          print("  ✅ 已为 %d 处 curl 加上重试参数" % n)
+
+          io.open(p, 'w', encoding='utf-8').write(s)
+          PYEOF
+
+          echo "=== 确认修改结果 ==="
+          grep -n 'dl_make\|dl.sh\|--retry' "$DF" | sed 's/^/  /'
 
       - name: 配置 Buildx
         uses: docker/setup-buildx-action@v3
