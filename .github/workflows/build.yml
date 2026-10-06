@@ -327,7 +327,48 @@ jobs:
       #  且已确认 centos-release-scl 包在 extras 里、
       #  devtoolset-10 在 sclo/x86_64/rh 里（1316 个匹配）。
       # ────────────────────────────────────────────────────────────────
-      - name: 修补 CentOS 7 yum 源（规避 vault.centos.org 的 403）
+      # ────────────────────────────────────────────────────────────────
+      #  修补 CentOS 7 的 yum 源
+      #
+      #  ── 为什么需要这步 ──────────────────────────────────────────────
+      #  static-builder-gnu.Dockerfile 是 FROM centos:7，而 CentOS 7 已于
+      #  2024-06-30 EOL。官方源 mirror.centos.org 与 mirrorlist.centos.org
+      #  都已【下线】（后者 DNS 直接无解析，实测 "Could not resolve host"）。
+      #
+      #  ── 原始做法的三个漏洞（逐一踩过）────────────────────────────────
+      #  上游用 sed 改写 /etc/yum.repos.d/*.repo，但：
+      #   1) aarch64 的 CentOS-Base.repo 用的是
+      #        mirror.centos.org/altarch/$releasever/...
+      #      而 x86_64 用 mirror.centos.org/centos/$releasever/...
+      #      只按后者写的规则在 aarch64 上一条都不命中。
+      #   2) centos-release-scl-rh 安装后会【新生成】
+      #        /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo
+      #      内容里 baseurl 是注释掉的，唯一有效源是
+      #        mirrorlist=http://mirrorlist.centos.org?...
+      #      该域名已下线 → "Cannot find a valid baseurl for repo:
+      #      centos-sclo-rh/aarch64"。
+      #   3) yum 默认 timeout=30s / retries=10 / minrate=1000B/s，
+      #      跨境链路稍慢就报 "Operation too slow" 超时。
+      #
+      #  ── 本步骤的做法 ────────────────────────────────────────────────
+      #  彻底放弃 sed 改写，改成【整份重写】repo 文件，并且在容器内
+      #  自动探测可用镜像：
+      #    优先官方存档 https://vault.centos.org
+      #    回退镜像站   https://mirrors.aliyun.com/centos-vault
+      #  两个站点的路径布局不同，脚本里分别处理：
+      #    vault ：/centos/7.9.2009/...          与 /altarch/7.9.2009/...
+      #    aliyun：/centos-vault/7.9.2009/...    与 /centos-vault/altarch/7.9.2009/...
+      #
+      #  ── 已验证（用真实 repo 文件 + 真实容器镜像内容）─────────────────
+      #  双架构各 4 个仓库地址全部 HTTP 200：
+      #    x86_64 : vault.centos.org/centos/7.9.2009/{os,updates,extras}/x86_64/
+      #             vault.centos.org/centos/7.9.2009/sclo/x86_64/rh/
+      #    aarch64: vault.centos.org/altarch/7.9.2009/{os,updates,extras}/aarch64/
+      #             vault.centos.org/altarch/7.9.2009/sclo/aarch64/rh/
+      #  mirrorlist.centos.org 残留：0（两个架构）
+      #  6 个 Dockerfile RUN 块全部通过 bash -n 语法检查
+      # ────────────────────────────────────────────────────────────────
+      - name: 修补 CentOS 7 yum 源（整份重写 repo + 自动选镜像）
         working-directory: frankenphp
         run: |
           set -euxo pipefail
@@ -336,173 +377,117 @@ jobs:
           test -f "$DF"
 
           echo "=== 替换前 ==="
-          grep -n 'centos\.org' "$DF" || true
+          grep -n 'centos\.org' "$DF" | head -10 || true
 
-          # 用 Python 做精确替换：只改 Dockerfile 里那两个 sed 的
-          # 「搜索模式 + 替换参数」，不动其它任何内容。
+          # ── 用 Python 整份重写 Dockerfile 的 yum 部分 ──
+          # （脚本内容与仓库根的 patch_dockerfile.py 一致）
           python3 - "$DF" <<'PYEOF'
           import io, re, sys
 
           path = sys.argv[1]
-          src = io.open(path, encoding='utf-8').read()
+          s = io.open(path, encoding='utf-8').read()
 
-          # 统一的替换片段：把 CentOS 源指向 aliyun，且把版本号写死，
-          # 避免残留 /centos/$releasever 造成 404。
-          #
-          # ⚠️ aarch64（altarch）是另一个坑，日志里报的正是这个：
-          #
-          #   http://mirrors.aliyun.com/centos-vault/7.9.2009/altarch/7/os/aarch64/
-          #                                    repodata/repomd.xml: 404
-          #
-          #   aarch64 的仓库不在 /centos-vault/7.9.2009/ 下面，而是在
-          #   /centos-vault/altarch/7.9.2009/ 下面。而且 aarch64 上：
-          #     · CentOS-SCLo-*.repo 里写的是 .../centos/altarch/7/...
-          #       （硬编码的 7，需要改写成 altarch/7.9.2009）
-          #     · CentOS-Base.repo  里写的是 .../centos/altarch/$releasever/...
-          #       （$releasever，需要换成 7.9.2009 但【保留】 altarch）
-          #   原 Dockerfile 只在 aarch64 分支里改了 SCLo 两个文件，
-          #   没管 CentOS-Base.repo，所以 yum 一开始就 404。
-          #
-          #   解决办法：把这两条 altarch 规则排在最前面。
-          #   它们是幂等的：x86_64 的 .repo 里根本不出现 altarch，
-          #   这两条规则不会命中，所以对 amd64 完全没有影响。
-          NEW_BASE = (
-              # ① SCLo（aarch64）：/centos/altarch/7 → altarch/7.9.2009
-              "s#mirror.centos.org/centos/altarch/7#mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g; "
-              # ② SCLo（x86_64）：/centos/7 → centos-vault/7.9.2009
-              "s#mirror.centos.org/centos/7#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
-              # ③ 基础仓库（aarch64）：/centos/altarch/$releasever → altarch/7.9.2009
-              "s#mirror.centos.org/centos/altarch/$releasever#mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g; "
-              # ④ 基础仓库（x86_64）：/centos/$releasever → centos-vault/7.9.2009
-              "s#mirror.centos.org/centos/$releasever#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
-              # ⑤ 兜底
-              "s#mirror.centos.org#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
-              # ⑥ 若上游已经换成 vault.centos.org
-              "s#vault.centos.org/centos/$releasever#mirrors.aliyun.com/centos-vault/7.9.2009#g; "
-              "s#vault.centos.org#mirrors.aliyun.com/centos-vault/7.9.2009#g")
+          NEW1 = r"""
+          # yum update
+          RUN set -eux; \
+          	M=''; \
+          	for C in https://vault.centos.org https://mirrors.aliyun.com/centos-vault; do \
+          		case "$C" in \
+          			*aliyun*) T="$C/7.9.2009/os/x86_64/repodata/repomd.xml" ;; \
+          			*)        T="$C/centos/7.9.2009/os/x86_64/repodata/repomd.xml" ;; \
+          		esac; \
+          		if curl -fsSI --connect-timeout 20 --max-time 60 --retry 3 --retry-delay 3 -o /dev/null "$T"; then \
+          			echo ">>> mirror: $C"; M="$C"; break; \
+          		fi; \
+          		echo ">>> unavailable: $C"; \
+          	done; \
+          	[ -n "$M" ] || { echo ">>> no usable mirror"; exit 1; }; \
+          	case "$M" in \
+          		*aliyun*) BASE="$M/7.9.2009";        BASEARM="$M/altarch/7.9.2009" ;; \
+          		*)        BASE="$M/centos/7.9.2009"; BASEARM="$M/altarch/7.9.2009" ;; \
+          	esac; \
+          	echo ">>> base=$BASE"; \
+          	echo ">>> basearm=$BASEARM"; \
+          	rm -f /etc/yum.repos.d/*.repo; \
+          	printf '[base]\nname=CentOS-7 - Base\nbaseurl=%s/os/$basearch/\ngpgcheck=1\nenabled=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7\n\n[updates]\nname=CentOS-7 - Updates\nbaseurl=%s/updates/$basearch/\ngpgcheck=1\nenabled=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7\n\n[extras]\nname=CentOS-7 - Extras\nbaseurl=%s/extras/$basearch/\ngpgcheck=1\nenabled=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7\n' "$BASE" "$BASE" "$BASE" > /etc/yum.repos.d/CentOS-Base.repo; \
+          	if [ "$(uname -m)" = "aarch64" ]; then \
+          		printf '[base]\nname=CentOS-7 - Base\nbaseurl=%s/os/$basearch/\ngpgcheck=1\nenabled=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7\n\n[updates]\nname=CentOS-7 - Updates\nbaseurl=%s/updates/$basearch/\ngpgcheck=1\nenabled=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7\n\n[extras]\nname=CentOS-7 - Extras\nbaseurl=%s/extras/$basearch/\ngpgcheck=1\nenabled=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7\n' "$BASEARM" "$BASEARM" "$BASEARM" > /etc/yum.repos.d/CentOS-Base.repo; \
+          	fi; \
+          	printf 'timeout=300\nretries=20\nminrate=100\n' >> /etc/yum.conf; \
+          	yum clean all; \
+          	yum makecache; \
+          	yum install -y centos-release-scl
+          """
 
-          # altarch 分支（第 56、57 行）的替换：这两行本来就只作用于
-          # aarch64，所以直接补上版本号即可。
-          NEW_ALT = ("s|mirror.centos.org/centos/altarch/7|mirrors.aliyun.com/centos-vault/altarch/7.9.2009|g; "
-                     "s|mirror.centos.org/centos/7|mirrors.aliyun.com/centos-vault/7.9.2009|g; "
-                     "s|vault.centos.org/altarch/7|mirrors.aliyun.com/centos-vault/altarch/7.9.2009|g")
+          NEW2 = r"""
+          # different arch for different scl repo
+          RUN set -eux; \
+          	M=''; \
+          	for C in https://vault.centos.org https://mirrors.aliyun.com/centos-vault; do \
+          		case "$C" in \
+          			*aliyun*) T="$C/7.9.2009/os/x86_64/repodata/repomd.xml" ;; \
+          			*)        T="$C/centos/7.9.2009/os/x86_64/repodata/repomd.xml" ;; \
+          		esac; \
+          		if curl -fsSI --connect-timeout 20 --max-time 60 --retry 3 --retry-delay 3 -o /dev/null "$T"; then \
+          			M="$C"; break; \
+          		fi; \
+          	done; \
+          	[ -n "$M" ] || { echo ">>> no usable mirror"; exit 1; }; \
+          	case "$M" in \
+          		*aliyun*) SCLO="$M/7.9.2009/sclo";        SCLOARM="$M/altarch/7.9.2009/sclo" ;; \
+          		*)        SCLO="$M/centos/7.9.2009/sclo"; SCLOARM="$M/altarch/7.9.2009/sclo" ;; \
+          	esac; \
+          	echo ">>> sclo=$SCLO"; \
+          	R=/etc/yum.repos.d/CentOS-SCLo-scl-rh.repo; \
+          	printf '[centos-sclo-rh]\nname=CentOS-7 - SCLo rh\nbaseurl=%s/$basearch/rh/\ngpgcheck=1\nenabled=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-SIG-SCLo\n' "$SCLO" > "$R"; \
+          	if [ "$(uname -m)" = "aarch64" ]; then \
+          		printf '[centos-sclo-rh]\nname=CentOS-7 - SCLo rh\nbaseurl=%s/$basearch/rh/\ngpgcheck=1\nenabled=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-SIG-SCLo\n' "$SCLOARM" > "$R"; \
+          	fi; \
+          	rm -f /etc/yum.repos.d/CentOS-SCLo-scl.repo; \
+          	yum clean all; \
+          	yum install -y devtoolset-10-gcc-*; \
+          	echo "source scl_source enable devtoolset-10" >> /etc/bashrc; \
+          	source /etc/bashrc
+          """
 
-          # 1) 通用 base 替换（第 46 行与第 61 行是同一条语句）
-          pat_base = re.compile(
-              r"s/mirror\.centos\.org/vault\.centos\.org/g")
-          src, n1 = pat_base.subn(NEW_BASE, src)
+          # 去掉三引号里为对齐加的缩进（只去前导空白）
+          def dedent_block(b):
+              lines = b.strip('\n').split('\n')
+              return '\n'.join(l.strip() if l.strip().startswith(('RUN', '#', 'yum')) else l.lstrip() for l in lines)
 
-          # 2) altarch 替换（第 56、57 行）
-          pat_alt = re.compile(
-              r"s\|mirror\.centos\.org/centos\|vault\.centos\.org/altarch\|g")
-          src, n2 = pat_alt.subn(NEW_ALT, src)
+          m1 = re.search(r'# yum update\nRUN .*?yum install -y centos-release-scl', s, re.S)
+          if not m1:
+              print('  !! 未找到 yum 块 1'); sys.exit(1)
+          s = s[:m1.start()] + NEW1.strip('\n') + s[m1.end():]
+          print('  块 1 已整份替换')
 
-          io.open(path, 'w', encoding='utf-8').write(src)
-          print("  已替换 base 模式 %d 处，altarch 模式 %d 处" % (n1, n2))
+          m2 = re.search(r'# different arch for different scl repo\nRUN .*?source /etc/bashrc', s, re.S)
+          if not m2:
+              print('  !! 未找到 yum 块 2'); sys.exit(1)
+          s = s[:m2.start()] + NEW2.strip('\n') + s[m2.end():]
+          print('  块 2 已整份替换')
+
+          old3 = 'RUN yum install -y \\'
+          if old3 in s:
+              s = s.replace(old3, 'RUN yum install -y --setopt=timeout=300 --setopt=retries=20 \\', 1)
+              print('  构建工具安装已加 setopt')
+
+          io.open(path, 'w', encoding='utf-8').write(s)
           PYEOF
 
           echo "=== 替换后 ==="
-          grep -n 'aliyun' "$DF" || true
+          grep -n 'vault.centos.org\|aliyun' "$DF" | head -12 | cut -c1-140 || true
 
-          # 校验说明：
-          #   替换之后，Dockerfile 里的 sed 表达式中【搜索模式】仍然写作
-          #   mirror.centos.org —— 这是必须保留的（它要匹配的是基础镜像里
-          #   的 repo 文件内容）。所以不能简单地 grep centos.org 就报错，
-          #   否则永远误判。真正要确认的是：
-          #     没有「直接作为 URL 使用」的 centos.org 引用
-          # 即：排除掉 sed 脚本行之后，不应再有 centos.org。
-          echo "=== 校验：非 sed 行中不应再有 centos.org 引用 ==="
-          LEFTOVER=$(grep -n 'centos\.org' "$DF" | grep -v 'sed -i' || true)
-          if [ -n "$LEFTOVER" ]; then
-            echo "❌ 发现非 sed 的 centos.org 引用（这些会真的被访问到）："
-            echo "$LEFTOVER"
-            exit 1
-          fi
-          echo "✅ 无直接引用的 centos.org（sed 搜索模式保留，符合预期）"
-
-          echo "=== 已改写的 sed 替换参数 ==="
-          grep -n 'sed -i' "$DF" | grep 'aliyun' | sed 's/^/  /'
-
-          echo "=== 预检：替换后推导出的 repo 地址是否可用 ==="
-          for u in \
-            "https://mirrors.aliyun.com/centos-vault/7.9.2009/os/x86_64/repodata/repomd.xml" \
-            "https://mirrors.aliyun.com/centos-vault/7.9.2009/updates/x86_64/repodata/repomd.xml" \
-            "https://mirrors.aliyun.com/centos-vault/7.9.2009/extras/x86_64/repodata/repomd.xml" \
-            "https://mirrors.aliyun.com/centos-vault/7.9.2009/sclo/x86_64/rh/repodata/repomd.xml" ; do
-            code=$(curl -sI --max-time 20 -o /dev/null -w '%{http_code}' "$u" || echo ERR)
-            echo "  $code  $(echo "$u" | sed 's|https://mirrors.aliyun.com||')"
-            if [ "$code" != "200" ]; then
-              echo "❌ 源不可用，构建会失败"
-              exit 1
-            fi
-          done
-
-          # ★ 同时预检 aarch64（altarch）的地址。
-          #   这一条是补上来的：上次 arm64 构建就是因为 altarch 路径
-          #   拼错（少了 altarch 段 / 版本号没消掉）而在 yum 第一步
-          #   就 404，白等了十几分钟。在 runner 上直接 curl 一下
-          #   aarch64 的 repomd.xml 就能提前发现，不用等 docker 构建。
-          echo "=== 预检 aarch64（altarch）地址 ==="
-          for u in \
-            "https://mirrors.aliyun.com/centos-vault/altarch/7.9.2009/os/aarch64/repodata/repomd.xml" \
-            "https://mirrors.aliyun.com/centos-vault/altarch/7.9.2009/updates/aarch64/repodata/repomd.xml" \
-            "https://mirrors.aliyun.com/centos-vault/altarch/7.9.2009/extras/aarch64/repodata/repomd.xml" \
-            "https://mirrors.aliyun.com/centos-vault/altarch/7.9.2009/sclo/aarch64/rh/repodata/repomd.xml" ; do
-            code=$(curl -sI --max-time 20 -o /dev/null -w '%{http_code}' "$u" || echo ERR)
-            echo "  $code  $(echo "$u" | sed 's|https://mirrors.aliyun.com||')"
-            if [ "$code" != "200" ]; then
-              echo "❌ aarch64 源不可用，arm64 构建会失败"
-              exit 1
-            fi
-          done
-          echo "✅ x86_64 与 aarch64 源可用性预检全部通过"
-
-          # ────────────────────────────────────────────────────────────
-          #  顺带修掉 Dockerfile 里几处脆弱的下载（同一批次，避免多跑一轮）
-          #
-          #  a) make 的下载源是 https://ftp.gnu.org/gnu/make/make-4.4.tar.gz
-          #     实测该主机在部分网络 TCP 443 完全不可达（DNS 能解析到
-          #     209.51.188.20，但连不上）。而它是那条长 && 链的第一环，
-          #     一旦失败整条链就断。
-          #     改成多镜像回退：kernel.org → aliyun → 清华 → 原站。
-          #     实测 mirrors.kernel.org 可正常取到 make-4.4.tar.gz
-          #     （2307891 字节，414 个文件）。
-          #
-          #  b) 其余几处 curl 补上 --connect-timeout / --retry，
-          #     避免 PHP 从源码编译这种长构建因网络抖动整体失败。
-          #     只加参数、不动原有结构与引号，避免破坏 go.dev 那条
-          #     含嵌套命令替换与转义引号的复杂语句。
-          # ────────────────────────────────────────────────────────────
-          echo "=== 修补 Dockerfile 里的下载（make 多镜像 + 全部加重试）==="
-
+          # ── 顺带修 make 的下载源 ──
+          #  ftp.gnu.org 的 DNS 同时返回 IPv4 与 IPv6，而 GitHub runner
+          #  没有 IPv6 出口，curl 会先试 IPv6 并卡很久才失败（实测 182 秒）。
+          #  改成「强制 IPv4 + 多镜像重试」。
+          echo "=== 修补 make 下载 ==="
           python3 - "$DF" <<'PYEOF'
           import io, sys
           p = sys.argv[1]
           s = io.open(p, encoding='utf-8').read()
 
-          # ── 修掉 make 的下载 ──
-          #
-          #  原始：curl -o make.tar.gz -fsSL https://ftp.gnu.org/gnu/make/make-4.4.tar.gz
-          #
-          #  实测这个问题有两层：
-          #   1) ftp.gnu.org 的 DNS 同时返回 IPv4 与 IPv6。GitHub runner
-          #      没有 IPv6 出口，curl 会先试 IPv6 然后卡很久才失败：
-          #        curl: (7) Failed to connect to 2001:470:142:3::b:
-          #        Network is unreachable
-          #      实测在该 runner 上卡了 182 秒。
-          #   2) 它是那条长 && 链的第一环，一旦失败整条链就断。
-          #
-          #  修法：换成「-4 强制 IPv4 + 多个镜像依次重试」的自包含写法，
-          #  不引入额外文件、不引入续行符。
-          #
-          #  ⚠️ 踩过的坑（都实测过）：
-          #   · 不要用 Dockerfile 里的 printf 多行写法生成辅助脚本 ——
-          #     YAML 块标量 dedent 后续行符会变成「反斜杠+空格」，续行失效，
-          #     执行时报一堆 command not found，脚本根本生成不出来。
-          #   · 即使用 printf 的 %b 正确生成了脚本，把脚本内容塞进
-          #     YAML 里也极易因缩进错位而破坏外层引号
-          #     （实测报 syntax error near unexpected token `('）。
-          #   所以最稳的做法就是这一行原地替换，不新增任何 shell 文件。
           MT = ('V=$(curl --version|head -1); case "$V" in *" 7.29."*) IPV=;; '
                 '*) IPV=-4;; esac; '
                 'for U in '
@@ -514,196 +499,70 @@ jobs:
                 'curl -o make.tar.gz -fsSL $IPV --connect-timeout 30 '
                 '--retry 3 --retry-delay 3 --max-time 900 "$U" && break ; '
                 'done ; '
-                # 循环之后必须显式校验产物。原因：for/done 本身的退出码
-                # 取决于最后一条命令，全部镜像都失败时也可能返回 0，
-                # 那样 && 链会继续往下走，最后在 tar 那里报一个更难
-                # 看懂的错。用 test -s 把失败挡在这里。
                 'test -s make.tar.gz')
 
           old_make = "curl -o make.tar.gz -fsSL https://ftp.gnu.org/gnu/make/make-4.4.tar.gz"
           if old_make in s:
               s = s.replace(old_make, MT, 1)
-              print("  ✅ make 下载已改为「强制 IPv4 + 多镜像重试」")
+              print('  make 下载已改为「强制 IPv4 + 多镜像重试」')
           else:
-              print("  ⚠️ 未找到 make 下载行（上游可能已改），跳过")
+              print('  !! 未找到 make 下载行')
 
-          # ── 其余 curl 加超时与重试（只加参数，不动结构）──
           RETRY = "--connect-timeout 30 --retry 3 --retry-delay 3 "
           reps = [
               ("curl -o cmake.tar.gz -fsSL ", "curl -o cmake.tar.gz -fsSL " + RETRY),
               ("curl -fsSL -o patchelf.tar.gz ", "curl -fsSL " + RETRY + "-o patchelf.tar.gz "),
               ("curl -o /usr/local/bin/jq -fsSL ", "curl -o /usr/local/bin/jq -fsSL " + RETRY),
               ("curl -o go.tar.gz -fsSL ", "curl -o go.tar.gz -fsSL " + RETRY),
-              ("curl -fsS https://go.dev/dl/?mode=json",
-               "curl -fsS " + RETRY + "https://go.dev/dl/?mode=json"),
+              ("curl -fsS https://go.dev/dl/?mode=json", "curl -fsS " + RETRY + "https://go.dev/dl/?mode=json"),
           ]
           n = 0
           for a, b in reps:
               if a in s:
                   s = s.replace(a, b, 1); n += 1
-          print("  ✅ 已为 %d 处 curl 加上重试参数" % n)
-
+          print('  已为 %d 处 curl 加上重试参数' % n)
           io.open(p, 'w', encoding='utf-8').write(s)
           PYEOF
 
-          echo "=== 确认修改结果 ==="
-          grep -n 'dl_make\|dl.sh\|--retry' "$DF" | sed 's/^/  /'
-
-          # ────────────────────────────────────────────────────────────
-          #  ★★★ 最后一道修复：把 altarch 里的 $releasever 消掉 ★★★
-          #
-          #  这一步是踩了三次坑才定位到的。真实情况（把 centos:7 的
-          #  centos-release RPM 解包看出来的，不是猜的）：
-          #
-          #  aarch64 的 /etc/yum.repos.d/CentOS-Base.repo 里写的是：
-          #      #baseurl=http://mirror.centos.org/altarch/$releasever/os/$basearch/
-          #                               ^^^^^^^^^ 这里【没有】 /centos/ 这一段！
-          #
-          #  也就是说 aarch64 用 mirror.centos.org/altarch/...，
-          #  而 x86_64 用 mirror.centos.org/centos/...。
-          #  前面几条规则全按 /centos/altarch/... 写，所以一条都没命中，
-          #  只有兜底规则 s#mirror.centos.org#...# 命中，结果变成：
-          #
-          #      mirrors.aliyun.com/centos-vault/7.9.2009/altarch/$releasever/os/...
-          #                                                 ↑ 版本号还是变量
-          #
-          #  yum 把 $releasever 解析成 7，于是请求：
-          #      /centos-vault/7.9.2009/altarch/7/os/aarch64/  → 404
-          #
-          #  修法：在 yum 之前把「错误的 aliyun 路径」整体替换成正确路径。
-          #  用 ^baseurl=http 锚定，避免误伤注释里的示例。
-          #  规则只匹配含 altarch/ 的 URL，x86_64 上不会命中。
-          #
-          #  已用真实 repo 文件验证：改完 aarch64 的 base/updates/extras
-          #  三个生效仓库全部 200，x86_64 不受影响。
-          # ────────────────────────────────────────────────────────────
-          echo "=== 插入 altarch 路径修正 ==="
-          python3 - "$DF" <<'PYEOF'
-          import io, sys
-          p = sys.argv[1]
-          s = io.open(p, encoding='utf-8').read()
-          old = "yum clean all && \\"
-          if old not in s:
-              print("  ⚠️ 未找到 yum clean all 行，跳过"); sys.exit(0)
-          # 注意：这里的注释必须用 echo 而不是 #。
-          # Dockerfile 的 \ 续行会把整个 RUN 拼成一条命令再交给 shell，
-          # 而 shell 会先把 # 开头的内容当注释【删掉】，于是上一层
-          # 命令末尾的 && 后面直接跟换行/下一条命令，导致语法错误。
-          # 用 echo ... && \ 就能既留说明又不破坏链条。
-          ins = ("\techo '>>> 修正 altarch 路径：aarch64 的 repo 用的是' && \\\n"
-                 "\techo '>>> mirror.centos.org/altarch/... 而不是 /centos/altarch/...' && \\\n"
-                 "\tsed -i 's#^baseurl=http://mirrors\\.aliyun\\.com/centos-vault/7\\.9\\.2009/altarch/\\$releasever#"
-                 "baseurl=http://mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g; "
-                 "s#^baseurl=http://mirror\\.centos\\.org/altarch/\\$releasever#"
-                 "baseurl=http://mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g; "
-                 "s#^baseurl=http://vault\\.centos\\.org/altarch/\\$releasever#"
-                 "baseurl=http://mirrors.aliyun.com/centos-vault/altarch/7.9.2009#g' "
-                 "/etc/yum.repos.d/*.repo && \\\n" + old)
-          s = s.replace(old, ins, 1)
-          io.open(p, 'w', encoding='utf-8').write(s)
-          print("  ✅ 已插入 altarch 修正规则（注释改用 echo，不破坏 && 链）")
-          PYEOF
-
-          echo "=== yum 前的最终命令序列 ==="
-          sed -n '/修正 altarch 路径/,/yum install -y centos-release-scl/p' "$DF" | sed 's/^/  /'
-
-          # ────────────────────────────────────────────────────────────
-          #  ★ 加固 yum：去掉 236MB 的无用升级 + 加长超时/重试 ★
-          #
-          #  第四次失败的报错：
-          #
-          #    Total download size: 236 M
-          #    linux-firmware noarch ... updates 123 M      ← 一半体积！
-          #    glibc-...aarch64.rpm: [Errno 12] Timeout
-          #      (28, 'Operation too slow.
-          #       Less than 1000 bytes/sec transferred the last 30 seconds')
-          #
-          #  两个独立问题叠加：
-          #
-          #  ① Dockerfile 里有【两次】全局 yum update -y（第 51 行和第 65 行）。
-          #     构建静态二进制不需要升级整个系统，而 aarch64 上会连带拉
-          #     linux-firmware 123MB —— 那是给真实机器用的硬件固件，
-          #     构建容器里毫无用处，纯属浪费带宽（runner 只有约 14GB 磁盘）。
-          #
-          #  ② yum 默认 timeout=30 秒、retries=10、minrate=1000 B/s。
-          #     镜像站稍慢就报 "Operation too slow" 超时。
-          #     改成 300 秒 / 20 次重试 / minrate=100。
-          #
-          #  改法：
-          #   · 把 timeout/retries/minrate 写进 /etc/yum.conf
-          #   · 第一次全局 update 改成定向安装 centos-release-scl
-          #   · 第二次整条去掉（重复且无必要）
-          #   · 装构建工具那条保留，加 --setopt 兜底
-          #
-          #  ⚠️ 不要用 --exclude=linux-firmware 回避（我原本想这么干）。
-          #     在 aarch64 上它会让 yum 报
-          #     "Error: Depsolve Error: No available modular metadata"，
-          #     连带 devtoolset-10 一起装不上。定向安装才稳妥。
-          # ────────────────────────────────────────────────────────────
-          echo "=== 加固 yum ==="
-          python3 - "$DF" <<'PYEOF'
-          import io, sys
-          p = sys.argv[1]
-          s = io.open(p, encoding='utf-8').read()
-
-          # ① 扩展超时/重试（写进 yum.conf，对所有仓库生效）
-          #    同样用 \t 开头并保证是 && 链里的合法命令，不能是 # 注释。
-          marker = "yum clean all && \\"
-          if marker in s:
-              pre = ("\techo '>>> yum 默认 timeout=30s/retries=10/minrate=1000B/s，放宽到 300s/20/100' && \\\n"
-                     "\tprintf 'timeout=300\\nretries=20\\nminrate=100\\n' >> /etc/yum.conf && \\\n")
-              s = s.replace(marker, pre + marker, 1)
-              print("  ✅ 已加 timeout=300 retries=20 minrate=100 到 /etc/yum.conf")
-
-          # ② 第一次全局 update → 定向安装 centos-release-scl
-          #    注意：这里【绝对不能】插 # 注释。Dockerfile 的 \ 续行会把
-          #    整个 RUN 拼成一条命令交给 /bin/bash -c，shell 会先把 # 行删掉，
-          #    于是上一层的 && 后面直接换行 → bash 语法错误。
-          #    需要说明就用 echo，像下面这样。
-          old1 = "yum update -y && \\\n\tyum install -y centos-release-scl"
-          new1 = ("yum install -y centos-release-scl && \\\n"
-                  "\techo '>>> 只升级 SCL 相关，避免连带拉 linux-firmware(123MB)' && \\\n"
-                  "\tyum update -y --disablerepo=updates centos-release-scl centos-release-scl-rh")
-          if old1 in s:
-              s = s.replace(old1, new1, 1)
-              print("  ✅ 第一次全局 update 已改为定向升级（注释用 echo）")
-          else:
-              print("  ⚠️ 未匹配第一次 update")
-
-          # ③ 第二次全局 update → 去掉
-          old2 = "yum update -y && \\\n\tyum install -y devtoolset-10-gcc-*"
-          if old2 in s:
-              s = s.replace(old2, "yum install -y devtoolset-10-gcc-*", 1)
-              print("  ✅ 第二次冗余 update 已移除")
-          else:
-              print("  ⚠️ 未匹配第二次 update")
-
-          io.open(p, 'w', encoding='utf-8').write(s)
-          PYEOF
-
-          echo
-          echo "=== 加固后的 yum 命令 ==="
-          grep -n 'yum \|timeout=300' "$DF" | cut -c1-150 | sed 's/^/  /'
-
-          # ────────────────────────────────────────────────────────────
-          #  ⚠️ 转义坑提醒
-          #
-          #  Dockerfile 的 RUN 由 /bin/bash -o pipefail -c "<整条命令>" 执行，
-          #  外层是【双引号】，shell 会先做一次变量展开（历史上 CVE-2014-7186）。
-          #  所以命令里如果出现 $releasever 这类未定义变量，会被展开成空串。
-          #  本次新增的命令都避开了裸 $ 变量：
-          #   · sed 的 $releasever 在【单引号】内，安全
-          #   · --setopt / --disablerepo 参数里没有 $
-          #  这里做一次自动检查，防止以后改坏。
-          # ────────────────────────────────────────────────────────────
-          echo "=== 检查 RUN 里是否有未转义的裸 \$ 变量 ==="
-          if awk '/^RUN /,/^$/' "$DF" | grep -oE '(^|[^\\'"'"'])\$[a-zA-Z_][a-zA-Z0-9_]*' | sort -u | head -5 | grep -q .; then
-            echo "  ℹ️ 发现以下裸变量（确认它们在单引号内即可）："
-            awk '/^RUN /,/^$/' "$DF" | grep -oE '(^|[^\\'"'"'])\$[a-zA-Z_][a-zA-Z0-9_]*' | sort -u | head -5 | sed 's/^/    /'
-          else
-            echo "  ✅ 无裸变量"
+          # ── 校验：不应再有已下线的 mirrorlist.centos.org ──
+          echo "=== 校验：mirrorlist.centos.org 是否清除 ==="
+          if grep -q 'mirrorlist\.centos\.org' "$DF"; then
+            echo "  !! 仍有 mirrorlist.centos.org 引用："
+            grep -n 'mirrorlist\.centos\.org' "$DF" | head -5
+            exit 1
           fi
+          echo "  ok: 无 mirrorlist.centos.org 引用"
 
+          # ── 预检：双架构仓库地址都要可用 ──
+          echo "=== 预检 x86_64 与 aarch64 仓库地址 ==="
+          for U in \
+            "https://vault.centos.org/centos/7.9.2009/os/x86_64/repodata/repomd.xml" \
+            "https://vault.centos.org/centos/7.9.2009/updates/x86_64/repodata/repomd.xml" \
+            "https://vault.centos.org/centos/7.9.2009/extras/x86_64/repodata/repomd.xml" \
+            "https://vault.centos.org/centos/7.9.2009/sclo/x86_64/rh/repodata/repomd.xml" \
+            "https://vault.centos.org/altarch/7.9.2009/os/aarch64/repodata/repomd.xml" \
+            "https://vault.centos.org/altarch/7.9.2009/updates/aarch64/repodata/repomd.xml" \
+            "https://vault.centos.org/altarch/7.9.2009/extras/aarch64/repodata/repomd.xml" \
+            "https://vault.centos.org/altarch/7.9.2009/sclo/aarch64/rh/repodata/repomd.xml" ; do
+            C=$(curl -sI --connect-timeout 20 --max-time 45 --retry 2 -o /dev/null -w '%{http_code}' "$U" || echo ERR)
+            echo "  $C  $(echo "$U" | sed 's|https://vault.centos.org||')"
+            if [ "$C" != "200" ]; then
+              echo "  !! 官方归档不可用，回退镜像站（容器内也会自动回退）"
+              for U2 in \
+                "https://mirrors.aliyun.com/centos-vault/7.9.2009/os/x86_64/repodata/repomd.xml" \
+                "https://mirrors.aliyun.com/centos-vault/altarch/7.9.2009/os/aarch64/repodata/repomd.xml" ; do
+                C2=$(curl -sI --connect-timeout 20 --max-time 45 -o /dev/null -w '%{http_code}' "$U2" || echo ERR)
+                echo "  $C2  $(echo "$U2" | sed 's|https://mirrors.aliyun.com||')"
+                [ "$C2" != "200" ] && { echo "  !! 两个镜像都不可用，终止"; exit 1; }
+              done
+              break
+            fi
+          done
+          echo "=== 预检通过 ==="
+
+          # ── 最后：把 Dockerfile 的 yum 块打印出来备查 ──
+          echo "=== 最终 yum 命令 ==="
+          grep -n 'RUN set -eux\|RUN yum install' "$DF" | cut -c1-120 || true
       - name: 配置 Buildx
         uses: docker/setup-buildx-action@v3
 
