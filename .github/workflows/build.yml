@@ -607,6 +607,103 @@ jobs:
           echo "=== yum 前的最终命令序列 ==="
           sed -n '/修正 altarch 路径/,/yum install -y centos-release-scl/p' "$DF" | sed 's/^/  /'
 
+          # ────────────────────────────────────────────────────────────
+          #  ★ 加固 yum：去掉 236MB 的无用升级 + 加长超时/重试 ★
+          #
+          #  第四次失败的报错：
+          #
+          #    Total download size: 236 M
+          #    linux-firmware noarch ... updates 123 M      ← 一半体积！
+          #    glibc-...aarch64.rpm: [Errno 12] Timeout
+          #      (28, 'Operation too slow.
+          #       Less than 1000 bytes/sec transferred the last 30 seconds')
+          #
+          #  两个独立问题叠加：
+          #
+          #  ① Dockerfile 里有【两次】全局 yum update -y（第 51 行和第 65 行）。
+          #     构建静态二进制不需要升级整个系统，而 aarch64 上会连带拉
+          #     linux-firmware 123MB —— 那是给真实机器用的硬件固件，
+          #     构建容器里毫无用处，纯属浪费带宽（runner 只有约 14GB 磁盘）。
+          #
+          #  ② yum 默认 timeout=30 秒、retries=10、minrate=1000 B/s。
+          #     镜像站稍慢就报 "Operation too slow" 超时。
+          #     改成 300 秒 / 20 次重试 / minrate=100。
+          #
+          #  改法：
+          #   · 把 timeout/retries/minrate 写进 /etc/yum.conf
+          #   · 第一次全局 update 改成定向安装 centos-release-scl
+          #   · 第二次整条去掉（重复且无必要）
+          #   · 装构建工具那条保留，加 --setopt 兜底
+          #
+          #  ⚠️ 不要用 --exclude=linux-firmware 回避（我原本想这么干）。
+          #     在 aarch64 上它会让 yum 报
+          #     "Error: Depsolve Error: No available modular metadata"，
+          #     连带 devtoolset-10 一起装不上。定向安装才稳妥。
+          # ────────────────────────────────────────────────────────────
+          echo "=== 加固 yum ==="
+          python3 - "$DF" <<'PYEOF'
+          import io, sys
+          p = sys.argv[1]
+          s = io.open(p, encoding='utf-8').read()
+
+          # ① 扩展超时/重试（写进 yum.conf，对所有仓库生效）
+          #    同样用 \t 开头并保证是 && 链里的合法命令，不能是 # 注释。
+          marker = "yum clean all && \\"
+          if marker in s:
+              pre = ("\techo '>>> yum 默认 timeout=30s/retries=10/minrate=1000B/s，放宽到 300s/20/100' && \\\n"
+                     "\tprintf 'timeout=300\\nretries=20\\nminrate=100\\n' >> /etc/yum.conf && \\\n")
+              s = s.replace(marker, pre + marker, 1)
+              print("  ✅ 已加 timeout=300 retries=20 minrate=100 到 /etc/yum.conf")
+
+          # ② 第一次全局 update → 定向安装 centos-release-scl
+          #    注意：这里【绝对不能】插 # 注释。Dockerfile 的 \ 续行会把
+          #    整个 RUN 拼成一条命令交给 /bin/bash -c，shell 会先把 # 行删掉，
+          #    于是上一层的 && 后面直接换行 → bash 语法错误。
+          #    需要说明就用 echo，像下面这样。
+          old1 = "yum update -y && \\\n\tyum install -y centos-release-scl"
+          new1 = ("yum install -y centos-release-scl && \\\n"
+                  "\techo '>>> 只升级 SCL 相关，避免连带拉 linux-firmware(123MB)' && \\\n"
+                  "\tyum update -y --disablerepo=updates centos-release-scl centos-release-scl-rh")
+          if old1 in s:
+              s = s.replace(old1, new1, 1)
+              print("  ✅ 第一次全局 update 已改为定向升级（注释用 echo）")
+          else:
+              print("  ⚠️ 未匹配第一次 update")
+
+          # ③ 第二次全局 update → 去掉
+          old2 = "yum update -y && \\\n\tyum install -y devtoolset-10-gcc-*"
+          if old2 in s:
+              s = s.replace(old2, "yum install -y devtoolset-10-gcc-*", 1)
+              print("  ✅ 第二次冗余 update 已移除")
+          else:
+              print("  ⚠️ 未匹配第二次 update")
+
+          io.open(p, 'w', encoding='utf-8').write(s)
+          PYEOF
+
+          echo
+          echo "=== 加固后的 yum 命令 ==="
+          grep -n 'yum \|timeout=300' "$DF" | cut -c1-150 | sed 's/^/  /'
+
+          # ────────────────────────────────────────────────────────────
+          #  ⚠️ 转义坑提醒
+          #
+          #  Dockerfile 的 RUN 由 /bin/bash -o pipefail -c "<整条命令>" 执行，
+          #  外层是【双引号】，shell 会先做一次变量展开（历史上 CVE-2014-7186）。
+          #  所以命令里如果出现 $releasever 这类未定义变量，会被展开成空串。
+          #  本次新增的命令都避开了裸 $ 变量：
+          #   · sed 的 $releasever 在【单引号】内，安全
+          #   · --setopt / --disablerepo 参数里没有 $
+          #  这里做一次自动检查，防止以后改坏。
+          # ────────────────────────────────────────────────────────────
+          echo "=== 检查 RUN 里是否有未转义的裸 \$ 变量 ==="
+          if awk '/^RUN /,/^$/' "$DF" | grep -oE '(^|[^\\'"'"'])\$[a-zA-Z_][a-zA-Z0-9_]*' | sort -u | head -5 | grep -q .; then
+            echo "  ℹ️ 发现以下裸变量（确认它们在单引号内即可）："
+            awk '/^RUN /,/^$/' "$DF" | grep -oE '(^|[^\\'"'"'])\$[a-zA-Z_][a-zA-Z0-9_]*' | sort -u | head -5 | sed 's/^/    /'
+          else
+            echo "  ✅ 无裸变量"
+          fi
+
       - name: 配置 Buildx
         uses: docker/setup-buildx-action@v3
 
