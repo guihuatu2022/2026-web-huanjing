@@ -301,106 +301,45 @@ jobs:
       #  第 12 行引用未定义的 $PS1，直接报 PS1: unbound variable。
       #  编译所需 PATH 由后面的 ENV 提供。
       #
-      #  这里生成的 Dockerfile 命令【全部写成单行】—— 彻底避开续行反斜杠、
-      #  Tab 缩进、以及 YAML 嵌套转义这三类易错点（前几版都栽在这上面）。
+      #  ★ 实现方式：Dockerfile 命令全部写成【单行】；改写用的 Python
+      #  脚本 base64 编码后内嵌为【单个 token】。这样彻底避开三个反复
+      #  踩坑的点：续行反斜杠、Tab 缩进、YAML 块标量的 dedent 与转义。
       # ────────────────────────────────────────────────────────────────
       - name: 修补 CentOS 7 yum 源（整份重写 repo + 自动选镜像）
         working-directory: frankenphp
+        env:
+          PY_MAIN: "aW1wb3J0IGlvLCByZSwgc3lzCgpwYXRoID0gc3lzLmFyZ3ZbMV0KcyA9IGlvLm9wZW4ocGF0aCwgZW5jb2Rpbmc9InV0Zi04IikucmVhZCgpCgpORVcxID0gJyMgeXVtIHVwZGF0ZVxuUlVOIHNldCAtZXV4OyBNSVJST1JTPVwnaHR0cHM6Ly9taXJyb3JzLmFsaXl1bi5jb20vY2VudG9zLXZhdWx0IGh0dHBzOi8vdmF1bHQuY2VudG9zLm9yZ1wnOyBwaWNrKCkgeyBmb3IgQyBpbiAkTUlSUk9SUzsgZG8gY2FzZSAiJEMiIGluICphbGl5dW4qKSBCPSIkQy83LjkuMjAwOSI7IEE9IiRDL2FsdGFyY2gvNy45LjIwMDkiIDs7ICopIEI9IiRDL2NlbnRvcy83LjkuMjAwOSI7IEE9IiRDL2FsdGFyY2gvNy45LjIwMDkiIDs7IGVzYWM7IFA9JChjdXJsIC1mc1MgLS1jb25uZWN0LXRpbWVvdXQgMjAgLS1tYXgtdGltZSA2MCAtLXJldHJ5IDIgIiRCL29zL3g4Nl82NC9yZXBvZGF0YS9yZXBvbWQueG1sIiAyPi9kZXYvbnVsbCB8IGdyZXAgLW8gXCdocmVmPSJyZXBvZGF0YS9bXiJdKnByaW1hcnkuc3FsaXRlLmJ6MiJcJyB8IGhlYWQgLTEgfCBzZWQgXCdzL2hyZWY9Ii8vO3MvIi8vXCcpOyBpZiBbIC1uICIkUCIgXSAmJiBjdXJsIC1mc1NJIC0tY29ubmVjdC10aW1lb3V0IDIwIC0tbWF4LXRpbWUgNjAgLS1yZXRyeSAyIC1vIC9kZXYvbnVsbCAiJEIvb3MveDg2XzY0LyRQIjsgdGhlbiBlY2hvICI+Pj4g5L2/55So6ZWc5YOPOiAkQyI7IHJldHVybiAwOyBmaTsgZWNobyAiPj4+IOS4jeWPr+eUqDogJEMiOyBkb25lOyByZXR1cm4gMTsgfTsgcGljazsgZWNobyAiPj4+IGJhc2U9JEIgYWx0YXJjaD0kQSI7IHJtIC1mIC9ldGMveXVtLnJlcG9zLmQvKi5yZXBvOyB3cml0ZV9iYXNlKCkgeyBwcmludGYgXCdbYmFzZV1cXG5uYW1lPUNlbnRPUy03IC0gQmFzZVxcbmJhc2V1cmw9JXMvb3MvJGJhc2VhcmNoL1xcbmdwZ2NoZWNrPTBcXG5lbmFibGVkPTFcXG5cXG5bdXBkYXRlc11cXG5uYW1lPUNlbnRPUy03IC0gVXBkYXRlc1xcbmJhc2V1cmw9JXMvdXBkYXRlcy8kYmFzZWFyY2gvXFxuZ3BnY2hlY2s9MFxcbmVuYWJsZWQ9MVxcblxcbltleHRyYXNdXFxubmFtZT1DZW50T1MtNyAtIEV4dHJhc1xcbmJhc2V1cmw9JXMvZXh0cmFzLyRiYXNlYXJjaC9cXG5ncGdjaGVjaz0wXFxuZW5hYmxlZD0xXFxuXCcgIiQxIiAiJDEiICIkMSIgPiAvZXRjL3l1bS5yZXBvcy5kL0NlbnRPUy1CYXNlLnJlcG87IH07IHdyaXRlX2Jhc2UgIiRCIjsgaWYgWyAiJCh1bmFtZSAtbSkiID0gImFhcmNoNjQiIF07IHRoZW4gd3JpdGVfYmFzZSAiJEEiOyBmaTsgcHJpbnRmIFwndGltZW91dD0zMDBcXG5yZXRyaWVzPTIwXFxubWlucmF0ZT0xMDBcXG5cJyA+PiAvZXRjL3l1bS5jb25mOyB5dW0gY2xlYW4gYWxsOyB5dW0gbWFrZWNhY2hlOyB5dW0gaW5zdGFsbCAteSBjZW50b3MtcmVsZWFzZS1zY2wnCk5FVzIgPSAnIyBkaWZmZXJlbnQgYXJjaCBmb3IgZGlmZmVyZW50IHNjbCByZXBvXG5SVU4gc2V0IC1ldXg7IE1JUlJPUlM9XCdodHRwczovL21pcnJvcnMuYWxpeXVuLmNvbS9jZW50b3MtdmF1bHQgaHR0cHM6Ly92YXVsdC5jZW50b3Mub3JnXCc7IHBpY2soKSB7IGZvciBDIGluICRNSVJST1JTOyBkbyBjYXNlICIkQyIgaW4gKmFsaXl1biopIEI9IiRDLzcuOS4yMDA5IjsgQT0iJEMvYWx0YXJjaC83LjkuMjAwOSIgOzsgKikgQj0iJEMvY2VudG9zLzcuOS4yMDA5IjsgQT0iJEMvYWx0YXJjaC83LjkuMjAwOSIgOzsgZXNhYzsgUD0kKGN1cmwgLWZzUyAtLWNvbm5lY3QtdGltZW91dCAyMCAtLW1heC10aW1lIDYwIC0tcmV0cnkgMiAiJEIvb3MveDg2XzY0L3JlcG9kYXRhL3JlcG9tZC54bWwiIDI+L2Rldi9udWxsIHwgZ3JlcCAtbyBcJ2hyZWY9InJlcG9kYXRhL1teIl0qcHJpbWFyeS5zcWxpdGUuYnoyIlwnIHwgaGVhZCAtMSB8IHNlZCBcJ3MvaHJlZj0iLy87cy8iLy9cJyk7IGlmIFsgLW4gIiRQIiBdICYmIGN1cmwgLWZzU0kgLS1jb25uZWN0LXRpbWVvdXQgMjAgLS1tYXgtdGltZSA2MCAtLXJldHJ5IDIgLW8gL2Rldi9udWxsICIkQi9vcy94ODZfNjQvJFAiOyB0aGVuIGVjaG8gIj4+PiDkvb/nlKjplZzlg486ICRDIjsgcmV0dXJuIDA7IGZpOyBlY2hvICI+Pj4g5LiN5Y+v55SoOiAkQyI7IGRvbmU7IHJldHVybiAxOyB9OyBwaWNrOyBjYXNlICIkQiIgaW4gKmFsaXl1biopIFM9IiR7QiUvNy45LjIwMDl9LzcuOS4yMDA5L3NjbG8iOyBTQT0iJHtCJS83LjkuMjAwOX0vYWx0YXJjaC83LjkuMjAwOS9zY2xvIiA7OyAqKSBTPSIkQi9zY2xvIjsgU0E9IiRBL3NjbG8iIDs7IGVzYWM7IGVjaG8gIj4+PiBzY2xvPSRTIjsgd3JpdGVfc2NsbygpIHsgcHJpbnRmIFwnW2NlbnRvcy1zY2xvLXJoXVxcbm5hbWU9Q2VudE9TLTcgLSBTQ0xvIHJoXFxuYmFzZXVybD0lcy8kYmFzZWFyY2gvcmgvXFxuZ3BnY2hlY2s9MFxcbmVuYWJsZWQ9MVxcblwnICIkMSIgPiAvZXRjL3l1bS5yZXBvcy5kL0NlbnRPUy1TQ0xvLXNjbC1yaC5yZXBvOyB9OyB3cml0ZV9zY2xvICIkUyI7IGlmIFsgIiQodW5hbWUgLW0pIiA9ICJhYXJjaDY0IiBdOyB0aGVuIHdyaXRlX3NjbG8gIiRTQSI7IGZpOyBybSAtZiAvZXRjL3l1bS5yZXBvcy5kL0NlbnRPUy1TQ0xvLXNjbC5yZXBvOyB5dW0gY2xlYW4gYWxsOyB5dW0gaW5zdGFsbCAteSBkZXZ0b29sc2V0LTEwLWdjYy0qOyBlY2hvIFwnc291cmNlIHNjbF9zb3VyY2UgZW5hYmxlIGRldnRvb2xzZXQtMTBcJyA+PiAvZXRjL2Jhc2hyYzsgZWNobyBcJ2RldnRvb2xzZXQtMTAgb2tcJycKCm0xID0gcmUuc2VhcmNoKHIiIyB5dW0gdXBkYXRlXG5SVU4gLio/eXVtIGluc3RhbGwgLXkgY2VudG9zLXJlbGVhc2Utc2NsIiwgcywgcmUuUykKaWYgbm90IG0xOgogICAgcHJpbnQoIiAgISEg5pyq5om+5YiwIHl1bSDlnZcgMSIpOyBzeXMuZXhpdCgxKQpzID0gc1s6bTEuc3RhcnQoKV0gKyBORVcxICsgc1ttMS5lbmQoKTpdCnByaW50KCIgIOWdlyAxIOW3suabv+aNoiIpCgojIOS4gOi3r+WQg+WIsOS4iua4uOWdl+acq+eahCBzb3VyY2UgL2V0Yy9iYXNocmPvvIzpgb/lhY3mrovnlZnlraTooYwKbTIgPSByZS5zZWFyY2gociIjIGRpZmZlcmVudCBhcmNoIGZvciBkaWZmZXJlbnQgc2NsIHJlcG9cblJVTiAuKj9zb3VyY2UgL2V0Yy9iYXNocmMiLCBzLCByZS5TKQppZiBub3QgbTI6CiAgICBwcmludCgiICAhISDmnKrmib7liLAgeXVtIOWdlyAyIik7IHN5cy5leGl0KDEpCnMgPSBzWzptMi5zdGFydCgpXSArIE5FVzIgKyBzW20yLmVuZCgpOl0KcHJpbnQoIiAg5Z2XIDIg5bey5pu/5o2iIikKCm9sZDMgPSAiUlVOIHl1bSBpbnN0YWxsIC15IFxcIgppZiBvbGQzIGluIHM6CiAgICBzID0gcy5yZXBsYWNlKG9sZDMsICJSVU4geXVtIGluc3RhbGwgLXkgLS1zZXRvcHQ9dGltZW91dD0zMDAgLS1zZXRvcHQ9cmV0cmllcz0yMCBcXCIsIDEpCiAgICBwcmludCgiICDmnoTlu7rlt6Xlhbflronoo4Xlt7LliqAgc2V0b3B0IikKCmlvLm9wZW4ocGF0aCwgInciLCBlbmNvZGluZz0idXRmLTgiKS53cml0ZShzKQo="
+          PY_EXTRA: "aW1wb3J0IGlvLCBzeXMKCnAgPSBzeXMuYXJndlsxXQpzID0gaW8ub3BlbihwLCBlbmNvZGluZz0idXRmLTgiKS5yZWFkKCkKCk1UID0gJ1Y9JChjdXJsIC0tdmVyc2lvbnxoZWFkIC0xKTsgY2FzZSAiJFYiIGluICoiIDcuMjkuIiopIElQVj07OyAqKSBJUFY9LTQ7OyBlc2FjOyBmb3IgVSBpbiBodHRwczovL21pcnJvcnMuYWxpeXVuLmNvbS9nbnUvbWFrZS9tYWtlLTQuNC50YXIuZ3ogaHR0cHM6Ly9taXJyb3JzLmtlcm5lbC5vcmcvZ251L21ha2UvbWFrZS00LjQudGFyLmd6IGh0dHBzOi8vbWlycm9ycy50dW5hLnRzaW5naHVhLmVkdS5jbi9nbnUvbWFrZS9tYWtlLTQuNC50YXIuZ3ogaHR0cHM6Ly9mdHAuZ251Lm9yZy9nbnUvbWFrZS9tYWtlLTQuNC50YXIuZ3ogOyBkbyBjdXJsIC1vIG1ha2UudGFyLmd6IC1mc1NMICRJUFYgLS1jb25uZWN0LXRpbWVvdXQgMzAgLS1yZXRyeSAzIC0tcmV0cnktZGVsYXkgMyAtLW1heC10aW1lIDkwMCAiJFUiICYmIGJyZWFrOyBkb25lOyB0ZXN0IC1zIG1ha2UudGFyLmd6JwpvbGQgPSAnY3VybCAtbyBtYWtlLnRhci5neiAtZnNTTCBodHRwczovL2Z0cC5nbnUub3JnL2dudS9tYWtlL21ha2UtNC40LnRhci5neicKaWYgb2xkIGluIHM6CiAgICBzID0gcy5yZXBsYWNlKG9sZCwgTVQsIDEpCiAgICBwcmludCgiICBtYWtlIOS4i+i9veW3suaUueS4uuWkmumVnOWDjyArIOW8uuWItiBJUHY0IikKClJFVFJZID0gIi0tY29ubmVjdC10aW1lb3V0IDMwIC0tcmV0cnkgMyAtLXJldHJ5LWRlbGF5IDMgIgpmb3IgYV8sIGJfIGluIFsoImN1cmwgLW8gY21ha2UudGFyLmd6IC1mc1NMICIsICJjdXJsIC1vIGNtYWtlLnRhci5neiAtZnNTTCAiICsgUkVUUlkpLAogICAgICAgICAgICAgICAoImN1cmwgLWZzU0wgLW8gcGF0Y2hlbGYudGFyLmd6ICIsICJjdXJsIC1mc1NMICIgKyBSRVRSWSArICItbyBwYXRjaGVsZi50YXIuZ3ogIiksCiAgICAgICAgICAgICAgICgiY3VybCAtbyAvdXNyL2xvY2FsL2Jpbi9qcSAtZnNTTCAiLCAiY3VybCAtbyAvdXNyL2xvY2FsL2Jpbi9qcSAtZnNTTCAiICsgUkVUUlkpLAogICAgICAgICAgICAgICAoImN1cmwgLW8gZ28udGFyLmd6IC1mc1NMICIsICJjdXJsIC1vIGdvLnRhci5neiAtZnNTTCAiICsgUkVUUlkpLAogICAgICAgICAgICAgICAoImN1cmwgLWZzUyBodHRwczovL2dvLmRldi9kbC8/bW9kZT1qc29uIiwgImN1cmwgLWZzUyAiICsgUkVUUlkgKyAiaHR0cHM6Ly9nby5kZXYvZGwvP21vZGU9anNvbiIpXToKICAgIGlmIGFfIGluIHM6CiAgICAgICAgcyA9IHMucmVwbGFjZShhXywgYl8sIDEpCgppby5vcGVuKHAsICJ3IiwgZW5jb2Rpbmc9InV0Zi04Iikud3JpdGUocykK"
+          PY_CHECK: "aW1wb3J0IGlvLCByZSwgc3VicHJvY2Vzcywgc3lzCgpzID0gaW8ub3BlbihzeXMuYXJndlsxXSwgZW5jb2Rpbmc9InV0Zi04IikucmVhZCgpCmxpbmVzID0gcy5zcGxpdCgiXG4iKQpydW5zID0gW10KaSA9IDAKd2hpbGUgaSA8IGxlbihsaW5lcyk6CiAgICBpZiBsaW5lc1tpXS5zdGFydHN3aXRoKCJSVU4gIik6CiAgICAgICAgYmxrID0gW2xpbmVzW2ldXQogICAgICAgIHdoaWxlIGJsa1stMV0ucnN0cmlwKCkuZW5kc3dpdGgoIlxcIikgYW5kIGkgKyAxIDwgbGVuKGxpbmVzKToKICAgICAgICAgICAgaSArPSAxCiAgICAgICAgICAgIGJsay5hcHBlbmQobGluZXNbaV0pCiAgICAgICAgcnVucy5hcHBlbmQoYmxrKQogICAgaSArPSAxCgpiYWQgPSAwCmZvciBuLCBibGsgaW4gZW51bWVyYXRlKHJ1bnMsIDEpOgogICAgY2wgPSBbXQogICAgZm9yIGxuIGluIGJsazoKICAgICAgICB0ID0gbG4ucnN0cmlwKCkKICAgICAgICBpZiB0LmVuZHN3aXRoKCJcXCIpOgogICAgICAgICAgICB0ID0gdFs6LTFdCiAgICAgICAgaWYgdC5zdHJpcCgpLnN0YXJ0c3dpdGgoIiMiKSBvciBub3QgdC5zdHJpcCgpOgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIGNsLmFwcGVuZCh0KQogICAgY21kID0gIiAiLmpvaW4oeC5zdHJpcCgpIGZvciB4IGluIGNsKQogICAgY21kID0gIiAiLmpvaW4oY21kLnNwbGl0KCkpCiAgICBpZiBub3QgY21kOgogICAgICAgIGNvbnRpbnVlCiAgICBwciA9IHN1YnByb2Nlc3MucnVuKFsiYmFzaCIsICItbiJdLCBpbnB1dD1jbWQgKyAiXG4iLAogICAgICAgICAgICAgICAgICAgICAgICBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUpCiAgICBpZiBwci5yZXR1cm5jb2RlICE9IDA6CiAgICAgICAgYmFkICs9IDEKICAgICAgICBwcmludCgiICAhISBSVU4gJWQ6ICVzIiAlIChuLCBwci5zdGRlcnIuc3RyaXAoKS5zcGxpdChjaHIoMTApKVswXVs6MTEwXSkpCnByaW50KCIgIFJVTiDlnZcgJWQg5Liq77yM6K+t5rOV6ZSZ6K+vICVkIOS4qiIgJSAobGVuKHJ1bnMpLCBiYWQpKQpzeXMuZXhpdCgxIGlmIGJhZCBlbHNlIDApCg=="
         run: |
           set -euxo pipefail
-
           DF=static-builder-gnu.Dockerfile
           test -f "$DF"
 
-          python3 - "$DF" <<'PYEOF'
-                    import io, re, sys
+          echo "=== 修补前 ==="
+          grep -c 'mirror\.centos\.org' "$DF" || true
 
-                    path = sys.argv[1]
-                    s = io.open(path, encoding='utf-8').read()
-
-                    NEW1 = '# yum update\nRUN set -eux; MIRRORS=\'https://mirrors.aliyun.com/centos-vault https://vault.centos.org\'; pick() { for C in $MIRRORS; do case "$C" in *aliyun*) B="$C/7.9.2009"; A="$C/altarch/7.9.2009" ;; *) B="$C/centos/7.9.2009"; A="$C/altarch/7.9.2009" ;; esac; P=$(curl -fsS --connect-timeout 20 --max-time 60 --retry 2 "$B/os/x86_64/repodata/repomd.xml" 2>/dev/null | grep -o \'href="repodata/[^"]*primary.sqlite.bz2"\' | head -1 | sed \'s/href="//;s/"//\'); if [ -n "$P" ] && curl -fsSI --connect-timeout 20 --max-time 60 --retry 2 -o /dev/null "$B/os/x86_64/$P"; then echo ">>> 使用镜像: $C"; return 0; fi; echo ">>> 不可用: $C"; done; return 1; }; pick; echo ">>> base=$B altarch=$A"; rm -f /etc/yum.repos.d/*.repo; write_base() { printf \'[base]\\nname=CentOS-7 - Base\\nbaseurl=%s/os/$basearch/\\ngpgcheck=0\\nenabled=1\\n\\n[updates]\\nname=CentOS-7 - Updates\\nbaseurl=%s/updates/$basearch/\\ngpgcheck=0\\nenabled=1\\n\\n[extras]\\nname=CentOS-7 - Extras\\nbaseurl=%s/extras/$basearch/\\ngpgcheck=0\\nenabled=1\\n\' "$1" "$1" "$1" > /etc/yum.repos.d/CentOS-Base.repo; }; write_base "$B"; if [ "$(uname -m)" = "aarch64" ]; then write_base "$A"; fi; printf \'timeout=300\\nretries=20\\nminrate=100\\n\' >> /etc/yum.conf; yum clean all; yum makecache; yum install -y centos-release-scl'
-                    NEW2 = '# different arch for different scl repo\nRUN set -eux; MIRRORS=\'https://mirrors.aliyun.com/centos-vault https://vault.centos.org\'; pick() { for C in $MIRRORS; do case "$C" in *aliyun*) B="$C/7.9.2009"; A="$C/altarch/7.9.2009" ;; *) B="$C/centos/7.9.2009"; A="$C/altarch/7.9.2009" ;; esac; P=$(curl -fsS --connect-timeout 20 --max-time 60 --retry 2 "$B/os/x86_64/repodata/repomd.xml" 2>/dev/null | grep -o \'href="repodata/[^"]*primary.sqlite.bz2"\' | head -1 | sed \'s/href="//;s/"//\'); if [ -n "$P" ] && curl -fsSI --connect-timeout 20 --max-time 60 --retry 2 -o /dev/null "$B/os/x86_64/$P"; then echo ">>> 使用镜像: $C"; return 0; fi; echo ">>> 不可用: $C"; done; return 1; }; pick; case "$B" in *aliyun*) S="${B%/7.9.2009}/7.9.2009/sclo"; SA="${B%/7.9.2009}/altarch/7.9.2009/sclo" ;; *) S="$B/sclo"; SA="$A/sclo" ;; esac; echo ">>> sclo=$S"; write_sclo() { printf \'[centos-sclo-rh]\\nname=CentOS-7 - SCLo rh\\nbaseurl=%s/$basearch/rh/\\ngpgcheck=0\\nenabled=1\\n\' "$1" > /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo; }; write_sclo "$S"; if [ "$(uname -m)" = "aarch64" ]; then write_sclo "$SA"; fi; rm -f /etc/yum.repos.d/CentOS-SCLo-scl.repo; yum clean all; yum install -y devtoolset-10-gcc-*; echo \'source scl_source enable devtoolset-10\' >> /etc/bashrc; echo \'devtoolset-10 ok（PATH 由后续 ENV 提供，不 source /etc/bashrc）\''
-
-                    m1 = re.search(r'# yum update\nRUN .*?yum install -y centos-release-scl', s, re.S)
-                    if not m1:
-                        print('  !! 未找到 yum 块 1'); sys.exit(1)
-                    s = s[:m1.start()] + NEW1 + s[m1.end():]
-                    print('  块 1 已替换')
-
-                    m2 = re.search(r'# different arch for different scl repo\nRUN .*?source /etc/bashrc', s, re.S)
-                    if not m2:
-                        print('  !! 未找到 yum 块 2'); sys.exit(1)
-                    s = s[:m2.start()] + NEW2 + s[m2.end():]
-                    print('  块 2 已替换')
-
-                    old3 = 'RUN yum install -y \\'
-                    if old3 in s:
-                        s = s.replace(old3, 'RUN yum install -y --setopt=timeout=300 --setopt=retries=20 \\', 1)
-                        print('  构建工具安装已加 setopt')
-
-                    io.open(path, 'w', encoding='utf-8').write(s)
-          PYEOF
-
-          python3 - "$DF" <<'PYEOF'
-                    import io, sys
-                    p = sys.argv[1]
-                    s = io.open(p, encoding='utf-8').read()
-                    MT = 'V=$(curl --version|head -1); case "$V" in *" 7.29."*) IPV=;; *) IPV=-4;; esac; for U in https://mirrors.aliyun.com/gnu/make/make-4.4.tar.gz https://mirrors.kernel.org/gnu/make/make-4.4.tar.gz https://mirrors.tuna.tsinghua.edu.cn/gnu/make/make-4.4.tar.gz https://ftp.gnu.org/gnu/make/make-4.4.tar.gz ; do curl -o make.tar.gz -fsSL $IPV --connect-timeout 30 --retry 3 --retry-delay 3 --max-time 900 "$U" && break; done; test -s make.tar.gz'
-                    old_make = 'curl -o make.tar.gz -fsSL https://ftp.gnu.org/gnu/make/make-4.4.tar.gz'
-                    if old_make in s:
-                        s = s.replace(old_make, MT, 1)
-                        print('  make 下载已改为多镜像 + 强制 IPv4')
-                    RETRY = '--connect-timeout 30 --retry 3 --retry-delay 3 '
-                    for a_, b_ in [('curl -o cmake.tar.gz -fsSL ', 'curl -o cmake.tar.gz -fsSL ' + RETRY),
-                                   ('curl -fsSL -o patchelf.tar.gz ', 'curl -fsSL ' + RETRY + '-o patchelf.tar.gz '),
-                                   ('curl -o /usr/local/bin/jq -fsSL ', 'curl -o /usr/local/bin/jq -fsSL ' + RETRY),
-                                   ('curl -o go.tar.gz -fsSL ', 'curl -o go.tar.gz -fsSL ' + RETRY),
-                                   ('curl -fsS https://go.dev/dl/?mode=json', 'curl -fsS ' + RETRY + 'https://go.dev/dl/?mode=json')]:
-                        if a_ in s: s = s.replace(a_, b_, 1)
-                    io.open(p, 'w', encoding='utf-8').write(s)
-          PYEOF
+          echo "$PY_MAIN"  | base64 -d | python3 - "$DF"
+          echo "$PY_EXTRA" | base64 -d | python3 - "$DF"
 
           echo "=== 校验：mirrorlist.centos.org 应为 0 ==="
-          grep -c 'mirrorlist\.centos\.org' "$DF" || true
+          if grep -q 'mirrorlist\.centos\.org' "$DF"; then
+            echo "  !! 仍有 mirrorlist 引用"
+            grep -n 'mirrorlist\.centos\.org' "$DF" | head -5
+            exit 1
+          fi
+          echo "  ok"
 
-          echo "=== 校验：source /etc/bashrc 应为 0 ==="
-          if grep -q '^[^#]*source /etc/bashrc' "$DF"; then
-            echo '  !! 仍有 source /etc/bashrc'
+          echo "=== 校验：Dockerfile 内不得有 source /etc/bashrc ==="
+          if grep -qE '^[^#]*source /etc/bashrc' "$DF"; then
+            echo "  !! 仍有 source /etc/bashrc"
             grep -n 'source /etc/bashrc' "$DF"
             exit 1
           fi
-          echo '  ok'
+          echo "  ok"
 
-          echo "=== 校验：Dockerfile 每个 RUN 块 bash -n ==="
-          python3 - "$DF" <<'PYEOF'
-                    import io, re, subprocess, sys
-                    s = io.open(sys.argv[1], encoding='utf-8').read()
-                    lines = s.split('\n'); runs = []; i = 0
-                    while i < len(lines):
-                        if lines[i].startswith('RUN '):
-                            blk = [lines[i]]
-                            while blk[-1].rstrip().endswith('\\') and i + 1 < len(lines):
-                                i += 1; blk.append(lines[i])
-                            runs.append(blk)
-                        i += 1
-                    bad = 0
-                    for n, blk in enumerate(runs, 1):
-                        cl = []
-                        for ln in blk:
-                            t = ln.rstrip()
-                            if t.endswith('\\'): t = t[:-1]
-                            if t.strip().startswith('#') or not t.strip(): continue
-                            cl.append(t)
-                        cmd = ' '.join(x.strip() for x in cl)
-                        cmd = ' '.join(cmd.split())
-                        if not cmd: continue
-                        pr = subprocess.run(['bash', '-n'], input=cmd + '\n', capture_output=True, text=True)
-                        if pr.returncode != 0:
-                            bad += 1
-                            print('  !! RUN %d: %s' % (n, pr.stderr.strip().split(chr(10))[0][:110]))
-                    print('  RUN 块 %d 个，语法错误 %d 个' % (len(runs), bad))
-                    sys.exit(1 if bad else 0)
-          PYEOF
+          echo "=== 校验：每个 RUN 块 bash -n ==="
+          echo "$PY_CHECK" | base64 -d | python3 - "$DF"
 
           echo "=== 完成 ==="
           grep -n 'RUN set -eux\|RUN yum install' "$DF" | cut -c1-100 || true
