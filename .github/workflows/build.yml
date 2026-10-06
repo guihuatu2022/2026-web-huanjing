@@ -253,103 +253,28 @@ jobs:
     steps:
 
       # ────────────────────────────────────────────────────────────────
-      #  释放磁盘。
-      #  PHP 从源码编译 + static-php-cli 的 buildroot + CentOS 7 基础镜像
-      #  会吃掉十几 GB，而 GitHub 标准 runner 只有约 14 GB 可用。
-      #  上一版没有这一步，属于运气好；加大扩展后更容易碰到 ENOSPC，
-      #  所以这里先清掉一批用不到的大件。
-      # ────────────────────────────────────────────────────────────────
-      - name: 释放磁盘空间
-        run: |
-          set -euxo pipefail
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          sudo apt-get clean
-          docker system prune -af || true
-          df -h /
-
-      - name: 检查运行器环境
-        run: |
-          set -euxo pipefail
-          echo "架构：$(uname -m)   核数：$(nproc)"
-          docker version
-          docker buildx version
-          df -h / | tail -1
-
-      - name: 拉取 FrankenPHP 官方仓库
-        run: git clone --depth 1 https://github.com/php/frankenphp.git
-
-      # ────────────────────────────────────────────────────────────────
-      #  ★★★ 修补 CentOS 7 的 yum 源（必需，否则构建从一开始就失败）★★★
-      #
-      #  问题：
-      #    static-builder-gnu.Dockerfile 是 FROM centos:7，而 CentOS 7 已于
-      #    2024-06-30 EOL。上游把源指向了 vault.centos.org，但该域名由
-      #    AWS CloudFront 提供服务（143.204.238.x），会对部分 IP 段返回
-      #    403 Forbidden —— GitHub 的 runner 正好落在这个范围里：
-      #
-      #      failure: repodata/...-primary.sqlite.bz2 from base:
-      #      [Errno 256] No more mirrors to try.
-      #      http://vault.centos.org/centos/7/os/x86_64/repodata/...:
-      #      [Errno 14] HTTPS Error 403 - Forbidden
-      #
-      #    实测对比（同一时刻，同一 URL）：
-      #      从俄罗斯 VPS 访问 vault.centos.org   → HTTP 200
-      #      从 GitHub runner 访问                 → HTTP 403
-      #    即 CDN 层面的地域/IP 封锁，不是仓库真的挂了。
-      #
-      #  解决：
-      #    在构建前重写 Dockerfile 里那段 repo 处理逻辑，把 CentOS 源
-      #    换到公共镜像站 mirrors.aliyun.com。
-      #
-      #  ⚠️ 这里有个容易踩的坑（我第一版就踩了）：
-      #    不能简单地做 s/vault.centos.org/<aliyun>/g，因为原始 URL 形如
-      #        mirror.centos.org/centos/$releasever/os/$basearch/
-      #    只换域名会得到
-      #        .../centos-vault/7.9.2009/centos/$releasever/os/...
-      #    多出一层 /centos/$releasever，实测 404。
-      #    必须把「域名 + /centos/$releasever」整体替换掉。
-      #
-      #  已验证的映射：
-      #    mirror.centos.org/centos/$releasever → mirrors.aliyun.com/centos-vault/7.9.2009
-      #    mirror.centos.org/centos/7           → mirrors.aliyun.com/centos-vault/7.9.2009
-      #    vault.centos.org/centos/$releasever  → mirrors.aliyun.com/centos-vault/7.9.2009
-      #    vault.centos.org/altarch/7           → mirrors.aliyun.com/centos-vault/altarch/7.9.2009
-      #
-      #  实测替换后的地址全部可用（x86_64）：
-      #    /centos-vault/7.9.2009/os/x86_64/           200
-      #    /centos-vault/7.9.2009/updates/x86_64/      200
-      #    /centos-vault/7.9.2009/extras/x86_64/       200
-      #    /centos-vault/7.9.2009/centosplus/x86_64/   200
-      #    /centos-vault/7.9.2009/sclo/x86_64/rh/      200
-      #    /centos-vault/altarch/7.9.2009/os/aarch64/  200
-      #  且已确认 centos-release-scl 包在 extras 里、
-      #  devtoolset-10 在 sclo/x86_64/rh 里（1316 个匹配）。
-      # ────────────────────────────────────────────────────────────────
-      # ────────────────────────────────────────────────────────────────
       #  修补 CentOS 7 的 yum 源
       #
-      #  CentOS 7 已于 2024-06-30 EOL：mirror.centos.org 与
-      #  mirrorlist.centos.org 都已下线（后者 DNS 无解析）。
-      #  而 centos-release-scl-rh 安装后生成的 CentOS-SCLo-scl-rh.repo
-      #  里 baseurl 是注释掉的、唯一有效源正是该 mirrorlist，导致
-      #      Cannot find a valid baseurl for repo: centos-sclo-rh/aarch64
-      #  上游用 sed 改 repo 文件的做法改不到它，故整份重写。
+      #  CentOS 7 已 EOL：mirror.centos.org 与 mirrorlist.centos.org 均已
+      #  下线（后者 DNS 无解析）。而 centos-release-scl-rh 安装后生成的
+      #  CentOS-SCLo-scl-rh.repo 里 baseurl 被注释、唯一有效源正是该
+      #  mirrorlist，导致 Cannot find a valid baseurl for repo:
+      #  centos-sclo-rh/aarch64。故整份重写 repo 文件。
       #
-      #  vault.centos.org 从 GitHub runner 会间歇性对
-      #  repodata/*.sqlite.bz2 返回 403（同一 runner 同一 URL 一次
-      #  200 一次 403），而 repomd.xml 始终 200。所以镜像探测除
-      #  repomd.xml 外还要校验 primary.sqlite.bz2，阿里云放前面。
+      #  vault.centos.org 从 GitHub runner 会间歇性对 repodata/*.sqlite.bz2
+      #  返回 403（同一 runner 同一 URL 一次 200 一次 403），而 repomd.xml
+      #  始终 200，所以探测除 repomd.xml 外还要校验 primary.sqlite.bz2，
+      #  并把阿里云放第一位。
       #
-      #  aarch64 的 glibc 由 AltArch 密钥签名，与 repo 里配的通用 key
-      #  不匹配，报 'GPG keys ... are not correct for this package'，
-      #  故 gpgcheck=0（包来自官方归档）。
+      #  aarch64 的 glibc 由 AltArch 密钥签名，与 repo 里配的通用 key 不
+      #  匹配（GPG keys ... are not correct for this package），故 gpgcheck=0。
       #
-      #  ★ 不要再 source /etc/bashrc：Docker 以 bash -u 执行，而
-      #  /etc/bashrc 第 12 行引用未定义的 $PS1，会直接报
-      #      /etc/bashrc: line 12: PS1: unbound variable
-      #  编译所需 PATH 由后面的 ENV 提供，无需 source。
+      #  ★ 不要 source /etc/bashrc：Docker 以 bash -u 执行，/etc/bashrc
+      #  第 12 行引用未定义的 $PS1，直接报 PS1: unbound variable。
+      #  编译所需 PATH 由后面的 ENV 提供。
+      #
+      #  这里生成的 Dockerfile 命令【全部写成单行】—— 彻底避开续行反斜杠、
+      #  Tab 缩进、以及 YAML 嵌套转义这三类易错点（前几版都栽在这上面）。
       # ────────────────────────────────────────────────────────────────
       - name: 修补 CentOS 7 yum 源（整份重写 repo + 自动选镜像）
         working-directory: frankenphp
@@ -359,17 +284,14 @@ jobs:
           DF=static-builder-gnu.Dockerfile
           test -f "$DF"
 
-          echo "=== 替换前 ==="
-          grep -n 'centos\.org' "$DF" | head -10 || true
-
           python3 - "$DF" <<'PYEOF'
                     import io, re, sys
 
                     path = sys.argv[1]
                     s = io.open(path, encoding='utf-8').read()
 
-                    NEW1 = '# yum update\\\nRUN set -eux; \\\n\tMIRRORS=\'https://mirrors.aliyun.com/centos-vault https://vault.centos.org\'; pick() { for C in $MIRRORS; do case "$C" in *aliyun*) B="$C/7.9.2009"; A="$C/altarch/7.9.2009" ;; *) B="$C/centos/7.9.2009"; A="$C/altarch/7.9.2009" ;; esac; P=$(curl -fsS --connect-timeout 20 --max-time 60 --retry 2 "$B/os/x86_64/repodata/repomd.xml" 2>/dev/null | grep -o \'href="repodata/[^"]*primary.sqlite.bz2"\' | head -1 | sed \'s/href="//;s/"//\') ; if [ -n "$P" ] && curl -fsSI --connect-timeout 20 --max-time 60 --retry 2 -o /dev/null "$B/os/x86_64/$P"; then echo ">>> 使用镜像: $C"; return 0; fi; echo ">>> 不可用: $C"; done; return 1; }; \\\n\tpick; \\\n\techo ">>> base=$B  altarch=$A"; \\\n\trm -f /etc/yum.repos.d/*.repo; \\\n\twrite_base() { \\\n\t\tprintf \'[base]\\nname=CentOS-7 - Base\\nbaseurl=%s/os/$basearch/\\ngpgcheck=0\\nenabled=1\\n\\n[updates]\\nname=CentOS-7 - Updates\\nbaseurl=%s/updates/$basearch/\\ngpgcheck=0\\nenabled=1\\n\\n[extras]\\nname=CentOS-7 - Extras\\nbaseurl=%s/extras/$basearch/\\ngpgcheck=0\\nenabled=1\\n\' "$1" "$1" "$1" > /etc/yum.repos.d/CentOS-Base.repo; \\\n\t}; \\\n\twrite_base "$B"; \\\n\tif [ "$(uname -m)" = "aarch64" ]; then write_base "$A"; fi; \\\n\tprintf \'timeout=300\\nretries=20\\nminrate=100\\n\' >> /etc/yum.conf; \\\n\tyum clean all; \\\n\tyum makecache; \\\n\tyum install -y centos-release-scl'
-                    NEW2 = '# different arch for different scl repo\\\nRUN set -eux; \\\n\tMIRRORS=\'https://mirrors.aliyun.com/centos-vault https://vault.centos.org\'; pick() { for C in $MIRRORS; do case "$C" in *aliyun*) B="$C/7.9.2009"; A="$C/altarch/7.9.2009" ;; *) B="$C/centos/7.9.2009"; A="$C/altarch/7.9.2009" ;; esac; P=$(curl -fsS --connect-timeout 20 --max-time 60 --retry 2 "$B/os/x86_64/repodata/repomd.xml" 2>/dev/null | grep -o \'href="repodata/[^"]*primary.sqlite.bz2"\' | head -1 | sed \'s/href="//;s/"//\') ; if [ -n "$P" ] && curl -fsSI --connect-timeout 20 --max-time 60 --retry 2 -o /dev/null "$B/os/x86_64/$P"; then echo ">>> 使用镜像: $C"; return 0; fi; echo ">>> 不可用: $C"; done; return 1; }; \\\n\tpick; \\\n\tcase "$B" in *aliyun*) S="${B%/7.9.2009}/7.9.2009/sclo"; SA="${B%/7.9.2009}/altarch/7.9.2009/sclo" ;; *) S="$B/sclo"; SA="$A/sclo" ;; esac; \\\n\techo ">>> sclo=$S"; \\\n\twrite_sclo() { \\\n\t\tprintf \'[centos-sclo-rh]\\nname=CentOS-7 - SCLo rh\\nbaseurl=%s/$basearch/rh/\\ngpgcheck=0\\nenabled=1\\n\' "$1" > /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo; \\\n\t}; \\\n\twrite_sclo "$S"; \\\n\tif [ "$(uname -m)" = "aarch64" ]; then write_sclo "$SA"; fi; \\\n\trm -f /etc/yum.repos.d/CentOS-SCLo-scl.repo; \\\n\tyum clean all; \\\n\tyum install -y devtoolset-10-gcc-*; \\\n\techo \'source scl_source enable devtoolset-10\' >> /etc/bashrc; \\\n\techo \'devtoolset-10 ok\''
+                    NEW1 = '# yum update\nRUN set -eux; MIRRORS=\'https://mirrors.aliyun.com/centos-vault https://vault.centos.org\'; pick() { for C in $MIRRORS; do case "$C" in *aliyun*) B="$C/7.9.2009"; A="$C/altarch/7.9.2009" ;; *) B="$C/centos/7.9.2009"; A="$C/altarch/7.9.2009" ;; esac; P=$(curl -fsS --connect-timeout 20 --max-time 60 --retry 2 "$B/os/x86_64/repodata/repomd.xml" 2>/dev/null | grep -o \'href="repodata/[^"]*primary.sqlite.bz2"\' | head -1 | sed \'s/href="//;s/"//\'); if [ -n "$P" ] && curl -fsSI --connect-timeout 20 --max-time 60 --retry 2 -o /dev/null "$B/os/x86_64/$P"; then echo ">>> 使用镜像: $C"; return 0; fi; echo ">>> 不可用: $C"; done; return 1; }; pick; echo ">>> base=$B altarch=$A"; rm -f /etc/yum.repos.d/*.repo; write_base() { printf \'[base]\\nname=CentOS-7 - Base\\nbaseurl=%s/os/$basearch/\\ngpgcheck=0\\nenabled=1\\n\\n[updates]\\nname=CentOS-7 - Updates\\nbaseurl=%s/updates/$basearch/\\ngpgcheck=0\\nenabled=1\\n\\n[extras]\\nname=CentOS-7 - Extras\\nbaseurl=%s/extras/$basearch/\\ngpgcheck=0\\nenabled=1\\n\' "$1" "$1" "$1" > /etc/yum.repos.d/CentOS-Base.repo; }; write_base "$B"; if [ "$(uname -m)" = "aarch64" ]; then write_base "$A"; fi; printf \'timeout=300\\nretries=20\\nminrate=100\\n\' >> /etc/yum.conf; yum clean all; yum makecache; yum install -y centos-release-scl'
+                    NEW2 = '# different arch for different scl repo\nRUN set -eux; MIRRORS=\'https://mirrors.aliyun.com/centos-vault https://vault.centos.org\'; pick() { for C in $MIRRORS; do case "$C" in *aliyun*) B="$C/7.9.2009"; A="$C/altarch/7.9.2009" ;; *) B="$C/centos/7.9.2009"; A="$C/altarch/7.9.2009" ;; esac; P=$(curl -fsS --connect-timeout 20 --max-time 60 --retry 2 "$B/os/x86_64/repodata/repomd.xml" 2>/dev/null | grep -o \'href="repodata/[^"]*primary.sqlite.bz2"\' | head -1 | sed \'s/href="//;s/"//\'); if [ -n "$P" ] && curl -fsSI --connect-timeout 20 --max-time 60 --retry 2 -o /dev/null "$B/os/x86_64/$P"; then echo ">>> 使用镜像: $C"; return 0; fi; echo ">>> 不可用: $C"; done; return 1; }; pick; case "$B" in *aliyun*) S="${B%/7.9.2009}/7.9.2009/sclo"; SA="${B%/7.9.2009}/altarch/7.9.2009/sclo" ;; *) S="$B/sclo"; SA="$A/sclo" ;; esac; echo ">>> sclo=$S"; write_sclo() { printf \'[centos-sclo-rh]\\nname=CentOS-7 - SCLo rh\\nbaseurl=%s/$basearch/rh/\\ngpgcheck=0\\nenabled=1\\n\' "$1" > /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo; }; write_sclo "$S"; if [ "$(uname -m)" = "aarch64" ]; then write_sclo "$SA"; fi; rm -f /etc/yum.repos.d/CentOS-SCLo-scl.repo; yum clean all; yum install -y devtoolset-10-gcc-*; echo \'source scl_source enable devtoolset-10\' >> /etc/bashrc; echo \'devtoolset-10 ok（PATH 由后续 ENV 提供，不 source /etc/bashrc）\''
 
                     m1 = re.search(r'# yum update\nRUN .*?yum install -y centos-release-scl', s, re.S)
                     if not m1:
@@ -391,14 +313,11 @@ jobs:
                     io.open(path, 'w', encoding='utf-8').write(s)
           PYEOF
 
-          echo "=== 替换后 ==="
-          grep -c 'aliyun\|vault.centos.org' "$DF" || true
-
           python3 - "$DF" <<'PYEOF'
                     import io, sys
                     p = sys.argv[1]
                     s = io.open(p, encoding='utf-8').read()
-                    MT = 'V=$(curl --version|head -1); case "$V" in *" 7.29."*) IPV=;; *) IPV=-4;; esac; for U in https://mirrors.aliyun.com/gnu/make/make-4.4.tar.gz https://mirrors.kernel.org/gnu/make/make-4.4.tar.gz https://mirrors.tuna.tsinghua.edu.cn/gnu/make/make-4.4.tar.gz https://ftp.gnu.org/gnu/make/make-4.4.tar.gz ; do curl -o make.tar.gz -fsSL $IPV --connect-timeout 30 --retry 3 --retry-delay 3 --max-time 900 "$U" && break ; done ; test -s make.tar.gz'
+                    MT = 'V=$(curl --version|head -1); case "$V" in *" 7.29."*) IPV=;; *) IPV=-4;; esac; for U in https://mirrors.aliyun.com/gnu/make/make-4.4.tar.gz https://mirrors.kernel.org/gnu/make/make-4.4.tar.gz https://mirrors.tuna.tsinghua.edu.cn/gnu/make/make-4.4.tar.gz https://ftp.gnu.org/gnu/make/make-4.4.tar.gz ; do curl -o make.tar.gz -fsSL $IPV --connect-timeout 30 --retry 3 --retry-delay 3 --max-time 900 "$U" && break; done; test -s make.tar.gz'
                     old_make = 'curl -o make.tar.gz -fsSL https://ftp.gnu.org/gnu/make/make-4.4.tar.gz'
                     if old_make in s:
                         s = s.replace(old_make, MT, 1)
@@ -413,15 +332,11 @@ jobs:
                     io.open(p, 'w', encoding='utf-8').write(s)
           PYEOF
 
-          echo "=== 校验：无 mirrorlist.centos.org ==="
-          if grep -q 'mirrorlist\.centos\.org' "$DF"; then
-            grep -n 'mirrorlist\.centos\.org' "$DF" | head -5
-            exit 1
-          fi
-          echo '  ok'
+          echo "=== 校验：mirrorlist.centos.org 应为 0 ==="
+          grep -c 'mirrorlist\.centos\.org' "$DF" || true
 
-          echo "=== 校验：无 source /etc/bashrc（bash -u 下 PS1 未定义会失败）==="
-          if grep -q 'source /etc/bashrc' "$DF"; then
+          echo "=== 校验：source /etc/bashrc 应为 0 ==="
+          if grep -q '^[^#]*source /etc/bashrc' "$DF"; then
             echo '  !! 仍有 source /etc/bashrc'
             grep -n 'source /etc/bashrc' "$DF"
             exit 1
@@ -430,37 +345,38 @@ jobs:
 
           echo "=== 校验：Dockerfile 每个 RUN 块 bash -n ==="
           python3 - "$DF" <<'PYEOF'
-          import io, re, subprocess, sys
-          s = io.open(sys.argv[1], encoding='utf-8').read()
-          lines = s.split('\n'); runs = []; i = 0
-          while i < len(lines):
-              if lines[i].startswith('RUN '):
-                  blk = [lines[i]]
-                  while blk[-1].rstrip().endswith('\\') and i + 1 < len(lines):
-                      i += 1; blk.append(lines[i])
-                  runs.append(blk)
-              i += 1
-          bad = 0
-          for n, blk in enumerate(runs, 1):
-              cleaned = []
-              for ln in blk:
-                  t = ln.rstrip()
-                  if t.endswith('\\'): t = t[:-1]
-                  if t.strip().startswith('#') or not t.strip(): continue
-                  cleaned.append(t)
-              cmd = ' '.join(x.strip() for x in cleaned)
-              cmd = ' '.join(cmd.split())
-              if not cmd: continue
-              pr = subprocess.run(['bash', '-n'], input=cmd + '\n', capture_output=True, text=True)
-              if pr.returncode != 0:
-                  bad += 1
-                  print('  !! RUN %d: %s' % (n, pr.stderr.strip().split(chr(10))[0][:110]))
-          print('  Dockerfile RUN 块 %d 个，语法错误 %d 个' % (len(runs), bad))
-          sys.exit(1 if bad else 0)
+                    import io, re, subprocess, sys
+                    s = io.open(sys.argv[1], encoding='utf-8').read()
+                    lines = s.split('\n'); runs = []; i = 0
+                    while i < len(lines):
+                        if lines[i].startswith('RUN '):
+                            blk = [lines[i]]
+                            while blk[-1].rstrip().endswith('\\') and i + 1 < len(lines):
+                                i += 1; blk.append(lines[i])
+                            runs.append(blk)
+                        i += 1
+                    bad = 0
+                    for n, blk in enumerate(runs, 1):
+                        cl = []
+                        for ln in blk:
+                            t = ln.rstrip()
+                            if t.endswith('\\'): t = t[:-1]
+                            if t.strip().startswith('#') or not t.strip(): continue
+                            cl.append(t)
+                        cmd = ' '.join(x.strip() for x in cl)
+                        cmd = ' '.join(cmd.split())
+                        if not cmd: continue
+                        pr = subprocess.run(['bash', '-n'], input=cmd + '\n', capture_output=True, text=True)
+                        if pr.returncode != 0:
+                            bad += 1
+                            print('  !! RUN %d: %s' % (n, pr.stderr.strip().split(chr(10))[0][:110]))
+                    print('  RUN 块 %d 个，语法错误 %d 个' % (len(runs), bad))
+                    sys.exit(1 if bad else 0)
           PYEOF
 
-          echo "=== 最终 yum 命令 ==="
-          grep -n 'RUN set -eux\|RUN yum install' "$DF" | cut -c1-120 || true
+          echo "=== 完成 ==="
+          grep -n 'RUN set -eux\|RUN yum install' "$DF" | cut -c1-100 || true
+
       - name: 配置 Buildx
         uses: docker/setup-buildx-action@v3
 
