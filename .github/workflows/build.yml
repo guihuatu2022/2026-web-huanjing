@@ -26,7 +26,35 @@
 #    复制它会被权限挡住（报 permission denied）。
 #
 # ============================================================================
-#  ★★★ 本次修订（相对上一版）★★★
+#  ★★★ 本次修订（2026-10-07，相对上一版）★★★
+#
+#  在俄罗斯 VPS（Debian 12 / glibc 2.36 / x86_64）上对现役二进制做了逐函数实测，
+#  结论：模块与主要扩展均正常，站点 HTTP=200。真实缺口只有下列几项，
+#  本版据此做「最小侵入增量」，不动其余已验证部分：
+#
+#   A) mbregex —— 修掉一个真实缺陷
+#        现役二进制 mbstring 在，但未启用 mbregex，导致 mb_ereg 系列未定义：
+#          mb_ereg        MISSING   ← 实测
+#       本版把 mbstring 写成 `mbstring,mbregex`（与 FrankenPHP 官方
+#       build-static.sh 默认集合里的写法一致）。
+#
+#   B) 补数据库接口 —— 用户要求"支持数据库接口即可，不封装数据库服务端"
+#        pdo_pgsql,pgsql   PostgreSQL（Typecho 官方支持三种库）
+#        （pdo_mysql,mysqli,mysqlnd,pdo_sqlite,sqlite3 原本就有）
+#
+#   C) 补常用内置扩展
+#        bcmath,gmp        部分 WordPress 插件/主题依赖，体积很小
+#
+#   D) 可复现性
+#        xcaddy_args 里的 @naive 是分支引用会漂移，改为钉 release tag
+#        `@v2.11.7-naive`（该 release 对应的 Caddy 为 2.11.7）。
+#
+#  未包含（如需请手动加）：intl（依赖 ICU，CentOS 7 上编译风险高）、
+#   sockets/posix/pcntl（FrankenPHP 已自带 posix/pcntl，
+#   且实测现有二进制已有 sockets）、imagick（体积大，gd 已够用）。
+#
+# ============================================================================
+#  ★★★ 上一版修订（保留备查）★★★
 #
 #  1) php_extensions 增加 5 个扩展 —— 上一版构建出的二进制缺少它们，
 #     导致 Typecho 1.3.0 无法运行（HTTP 500）：
@@ -161,7 +189,7 @@ on:
         description: 'PHP 扩展（逗号分隔）'
         required: true
         default: >-
-          opcache,pdo_mysql,mysqli,pdo_sqlite,sqlite3,curl,mbstring,gd,zip,openssl,fileinfo,dom,iconv,exif,ctype,filter,session,tokenizer,xml
+          opcache,pdo_mysql,mysqli,pdo_sqlite,sqlite3,pdo_pgsql,pgsql,curl,mbstring,mbregex,gd,zip,openssl,fileinfo,dom,iconv,exif,ctype,filter,session,tokenizer,xml,bcmath,gmp
 
       php_extension_libs:
         description: '扩展依赖库（逗号分隔；gd 需要它们才能处理 JPEG/WebP 和写中文）'
@@ -173,7 +201,7 @@ on:
         required: true
         default: >-
           --with github.com/dunglas/caddy-cbrotli
-          --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive
+          --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@v2.11.7-naive
           --with github.com/caddy-dns/cloudflare
 
       build_arch:
