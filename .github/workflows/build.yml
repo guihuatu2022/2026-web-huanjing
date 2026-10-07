@@ -45,9 +45,24 @@
 #   C) 补常用内置扩展
 #        bcmath,gmp        部分 WordPress 插件/主题依赖，体积很小
 #
-#   D) 可复现性
-#        xcaddy_args 里的 @naive 是分支引用会漂移，改为钉 release tag
-#        `@v2.11.7-naive`（该 release 对应的 Caddy 为 2.11.7）。
+#   D) 可复现性 —— 并且踩掉了一个真实的坑
+#        xcaddy_args 里的 @naive 是分支引用会漂移，本想改为钉 release tag
+#        `@v2.11.7-naive`，结果构建直接失败：
+#
+#          go: errors parsing go.mod:
+#          go.mod:9: replace github.com/klzgrad/forwardproxy:
+#            version "v2.11.7-naive" invalid: should be v0 or v1, not v2
+#
+#        原因：klzgrad/forwardproxy 的模块路径**没有 /v2 后缀**
+#        （module github.com/caddyserver/forwardproxy，由 replace 顶替上游），
+#        而 release tag 里的 2.11.7 指的是**上游 Caddy 版本**，不是模块自身版本。
+#        所以该 fork 的 tag 一律不能用作模块版本，**只能用分支或 commit SHA**。
+#
+#        已改为钉 commit SHA：
+#          c096d6a00cb28e019cc1995b04bdc6a9311d8024
+#        （= v2.11.7-naive 这个 tag 指向的 commit，也是 naive 分支当时的 HEAD，
+#          2026-10-06 «Use sing-quic BBRv1 for QUIC»）
+#        SHA 能同时满足"可复现"与"Go 版本号合法"。
 #
 #  未包含（如需请手动加）：intl（依赖 ICU，CentOS 7 上编译风险高）、
 #   sockets/posix/pcntl（FrankenPHP 已自带 posix/pcntl，
@@ -201,7 +216,7 @@ on:
         required: true
         default: >-
           --with github.com/dunglas/caddy-cbrotli
-          --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@v2.11.7-naive
+          --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024
           --with github.com/caddy-dns/cloudflare
 
       build_arch:
