@@ -473,7 +473,16 @@ jobs:
           ./${{ matrix.binary }} version
 
           NEED=$(printf '%s' "$IN_PHP_EXTENSIONS" | tr -d ' \n' | sed 's/,/","/g')
-          echo '<?php $need=["'"$NEED"'"]; $have=array_map(function($e){return str_replace("zend ","",strtolower($e));},get_loaded_extensions()); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "实际装了 ",count($have)," 个扩展：\n  ",implode(", ",$have),"\n"; if($miss){echo "缺少：",implode(", ",$miss),"\n"; exit(1);} echo "扩展齐全\n";' > /tmp/check.php
+          # ★ 从"扩展名"断言里剔除 mbregex。
+          #   mbregex 不是独立扩展，而是 mbstring 的编译期子特性（决定
+          #   mb_ereg* 系列是否编入），永远不会出现在 get_loaded_extensions()
+          #   里。它是否生效由"自检 A2"用 function_exists('mb_ereg') 验证。
+          #   把 mbstring 与 mbregex 一起写进 spc 的扩展列表是合法的写法
+          #   （与 FrankenPHP 官方 build-static.sh 的 defaultExtensions 一致），
+          #   只是不能拿去和扩展名列表做 diff。
+          CHECK_EXT=$(printf '%s' "$IN_PHP_EXTENSIONS" | tr -d ' \n' | tr ',' '\n' | grep -vx 'mbregex' | paste -sd, -)
+          NEED=$(printf '%s' "$CHECK_EXT" | sed 's/,/","/g')
+          echo '<?php $need=["'"$NEED"'"]; $have=array_map(function($e){return str_replace("zend ","",strtolower($e));},get_loaded_extensions()); $miss=array_values(array_diff($need,$have)); echo "PHP ",PHP_VERSION,"\n"; echo "实际装了 ",count($have)," 个扩展：\n  ",implode(", ",$have),"\n"; if($miss){echo "缺少：",implode(", ",$miss),"\n"; exit(1);} echo "扩展齐全（mbregex 已从扩展名断言中剔除，见自检 A2）\n";' > /tmp/check.php
 
           ./${{ matrix.binary }} php-cli /tmp/check.php
 
